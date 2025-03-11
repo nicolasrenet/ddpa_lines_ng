@@ -40,7 +40,7 @@ class DataException( Exception ):
 """
 Utility classes to manage charter segmentation data.
 
-TODO: handle memory limit for samples.
+TODO: handle memory limit for samples - a dataset object should be a generator.
 
 
 
@@ -300,7 +300,7 @@ class ChartersDataset(VisionDataset):
             if tsv_path.exists():
                 self.work_folder_path = tsv_path.parent
                 # paths are assumed to be absolute
-                self.data = self.load_from_tsv( tsv_path )
+                self.data = self.load_items_from_tsv( tsv_path )
                 logger.debug("data={}".format( self.data[:6]))
             else:
                 raise FileNotFoundError(f'File {tsv_path} does not exist!')
@@ -346,8 +346,7 @@ class ChartersDataset(VisionDataset):
         for mask_path in work_folder_path.glob('*.masks.npy.gz'):
             sample_dict = {}
             page_prefix = re.sub(r'\..+', '', str(mask_path))
-            with gzip.GzipFile( mask_path, 'r') as zf:
-                sample_dict['masks']=np.load( zf )
+            sample_dict['masks']=mask_path.absolute()
             with gzip.GzipFile( Path(page_prefix).with_suffix('.boxes.npy.gz'), 'r') as zf:
                 sample_dict['boxes']=np.load( zf )
 
@@ -375,14 +374,14 @@ class ChartersDataset(VisionDataset):
         """
         samples = []
         with open( file_path, 'r') as infile:
+            work_folder = Path(file_path).parent
             for line in infile:
                 sample_dict = {}
                 img_filename, box_filename, mask_filename = line[:-1].split('\t')
-                with gzip.GzipFile( mask_filename, 'r') as zf:
-                    sample_dict['masks']=np.load( zf )
-                with gzip.GzipFile( box_filename, 'r') as zf:
+                sample_dict['masks']=work_folder.joinpath( mask_filename )
+                with gzip.GzipFile( work_folder.joinpath(box_filename), 'r') as zf:
                     sample_dict['boxes']=np.load( zf )
-                samples.append( (Path(img_filename), sample_dict ))
+                samples.append( (work_folder.joinpath(img_filename), sample_dict ))
         return samples
 
 
@@ -477,7 +476,6 @@ class ChartersDataset(VisionDataset):
                 elif 'json' in self.config['gt_suffix']:
                     boxes, masks = seglib.line_masks_from_img_json_files( img_path, page, key=self.config['polygon_key'] )
 
-                sample = (sample_img_path, { 'boxes': boxes, 'masks': masks })
                 # - on-disk: 1 image + 1 tensor of boxes + 1 tensor of masks
                 try:
                     page_image = Image.open( img_path, 'r')
@@ -485,13 +483,15 @@ class ChartersDataset(VisionDataset):
                     logger.debug( f'{dcb}: ignoring page' )
                     return None
                 msk_filename = f'{page_id}.masks.npy.gz'
-                with gzip.GzipFile( work_folder_path.joinpath(msk_filename), 'w') as zf:
+                msk_filepath = work_folder_path.joinpath(msk_filename).absolute()
+                with gzip.GzipFile( msk_filepath, 'w') as zf:
                     np.save( zf, masks )
                 box_filename = f'{page_id}.boxes.npy.gz'
                 with gzip.GzipFile( work_folder_path.joinpath(box_filename), 'w') as zf:
                     np.save( zf, boxes )
 
-                samples.append( sample )
+                # live sample does not store the masks, to save space
+                samples.append((sample_img_path, { 'boxes': boxes, 'masks': msk_filepath} ))
                 cnt += 1
                 if self.config['count'] and cnt == self.config['count']:
                     break
@@ -522,7 +522,7 @@ class ChartersDataset(VisionDataset):
                     raise FileNotFoundError("Could not find {}. Abort.".format( boxes_filename ))
                 if not work_folder_path.joinpath(masks_filename).exists():
                     raise FileNotFoundError("Could not find {}. Abort.".format( masks_filename ))
-                of.write("{}\t{}\t{}".format( img_filename, boxes_filename, masks_filename ))
+                of.write("{}\t{}\t{}\n".format( img_filename, boxes_filename, masks_filename ))
 
 
     @staticmethod
@@ -592,14 +592,15 @@ class ChartersDataset(VisionDataset):
         # 
         sample = self.data[index]
         img_array_hwc = ski.io.imread( img_path )
-        
+        mask_array_nhw = np.load (gzip.GzipFile(sample[1]['masks'], 'r'))
+
         return (
             v2.Compose( [v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])(img_array_hwc),
             { 
                 'id': Path(img_path).name,
                 'boxes': torch.tensor(sample[1]['boxes']),
                 'labels': torch.ones( (len(sample[1]['boxes'])), dtype=torch.int64),
-                'masks': torch.tensor( sample[1]['masks']), 
+                'masks': torch.tensor( mask_array_nhw )
              })
 
 

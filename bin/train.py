@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 r"""PyTorch Detection Training.
 
 To run in a multi-gpu environment, use the distributed launcher::
@@ -20,6 +21,8 @@ the number of epochs should be adapted so that we have the same number of iterat
 import datetime
 import os
 import time
+import sys
+from pathlib import Path
 
 import presets
 import torch
@@ -27,13 +30,17 @@ import torch.utils.data
 import torchvision
 import torchvision.models.detection
 import torchvision.models.detection.mask_rcnn
-import utils
-from coco_utils import get_coco
-from engine import evaluate, train_one_epoch
-from group_by_aspect_ratio import create_aspect_ratio_groups, GroupedBatchSampler
 from torchvision.transforms import InterpolationMode
-from transforms import SimpleCopyPaste
 
+sys.path.append( str(Path(__file__).parents[1] ))
+
+from libs.engine import evaluate, train_one_epoch
+from libs import utils
+from libs.group_by_aspect_ratio import create_aspect_ratio_groups, GroupedBatchSampler
+from libs.transforms import SimpleCopyPaste
+from libs import charters_seg
+
+sys.exit()
 
 def copypaste_collate_fn(batch):
     copypaste = SimpleCopyPaste(blending=True, resize_interpolation=InterpolationMode.BILINEAR)
@@ -41,19 +48,8 @@ def copypaste_collate_fn(batch):
 
 
 def get_dataset(is_train, args):
-    image_set = "train" if is_train else "val"
-    num_classes, mode = {"coco": (91, "instances"), "coco_kp": (2, "person_keypoints")}[args.dataset]
-    with_masks = "mask" in args.model
-    ds = get_coco(
-        root=args.data_path,
-        image_set=image_set,
-        transforms=get_transform(is_train, args),
-        mode=mode,
-        use_v2=args.use_v2,
-        with_masks=with_masks,
-    )
-    return ds, num_classes
-
+    ds = charters_seg.ChartersDataset(from_tsv_file='./data/testing/{}'.format('charter_ds_test.tsv' if is_train else 'charter_ds_validate.tsv'))
+    return ds, 1
 
 def get_transform(is_train, args):
     if is_train:
@@ -182,12 +178,6 @@ def get_args_parser(add_help=True):
 def main(args):
     if args.backend.lower() == "tv_tensor" and not args.use_v2:
         raise ValueError("Use --use-v2 if you want to use the tv_tensor backend.")
-    if args.dataset not in ("coco", "coco_kp"):
-        raise ValueError(f"Dataset should be coco or coco_kp, got {args.dataset}")
-    if "keypoint" in args.model and args.dataset != "coco_kp":
-        raise ValueError("Oops, if you want Keypoint detection, set --dataset coco_kp")
-    if args.dataset == "coco_kp" and args.use_v2:
-        raise ValueError("KeyPoint detection doesn't support V2 transforms yet")
 
     if args.output_dir:
         utils.mkdir(args.output_dir)
