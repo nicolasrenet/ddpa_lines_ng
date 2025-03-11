@@ -38,7 +38,11 @@ class DataException( Exception ):
 
 
 """
-Utility classes to manage charter data.
+Utility classes to manage charter segmentation data.
+
+TODO: handle memory limit for samples.
+
+
 
 """
 
@@ -127,7 +131,6 @@ class ChartersDataset(VisionDataset):
                 Ex. 'htr.gt.json'
             polygon_key (str): in the input segmentation dictionary, key for the polygon boundaries:
                 'boundary' (default)
-
         """
 
         # A dataset resource dictionary needed, unless we build from existing files
@@ -354,7 +357,7 @@ class ChartersDataset(VisionDataset):
                     break
             if not img_suffix:
                 raise FileNotFoundError("Could not find an image file.")
-            samples.append( ( Path(page_prefix).with_suffix(suffix), sample_dict))
+            samples.append( ( Path(page_prefix).with_suffix(img_suffix), sample_dict))
         return samples
 
 
@@ -512,12 +515,9 @@ class ChartersDataset(VisionDataset):
             for sample in samples:
                 img_filename = sample[0].name
                 work_folder_path = sample[0].parent
-                print(work_folder_path)
                 file_prefix = re.sub(r'\..+', '', img_filename )
                 boxes_filename = Path(file_prefix).with_suffix('.boxes.npy.gz')
                 masks_filename = Path(file_prefix).with_suffix('.masks.npy.gz')
-                print(work_folder_path.joinpath(masks_filename))
-                print(work_folder_path.joinpath(boxes_filename))
                 if not work_folder_path.joinpath(boxes_filename).exists():
                     raise FileNotFoundError("Could not find {}. Abort.".format( boxes_filename ))
                 if not work_folder_path.joinpath(masks_filename).exists():
