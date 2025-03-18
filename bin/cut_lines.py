@@ -8,14 +8,24 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import sys
 import itertools
+import re
 
 
 
 
 # 1. open image as gray  and line metadata
 
-page_img = Image.open('./data/boxes/f1ea2db678e04f513d2238604c73839f.Wr_OldText.0.img.jpg')
-line_dict = json.load(open('./data/boxes/f1ea2db678e04f513d2238604c73839f.Wr_OldText.0.lines.gt.json'))
+img = Image.open(sys.argv[1])
+line_dict = json.load(open(re.sub(r'.img.jpg', '.lines.gt.json', sys.argv[1])))
+
+img_hwc = np.array( img )
+img_hw = ski.color.rgb2gray( img_hwc )
+img_hw = ski.filters.rank.mean( img_hw, footprint=np.full((10,10),1))
+thresh = ski.filters.threshold_otsu( img_hw )
+binary_img = img_hw < thresh
+img_mask = np.zeros(img_hw.shape, dtype='bool')
+
+
 
 region_props = []
 
@@ -23,40 +33,41 @@ for line in line_dict['lines']:
     polygon_coordinates = [ tuple(pair) for pair in line['coreBoundary']  ]
     line_bbox = ImagePath.Path( polygon_coordinates ).getbbox()
     base_line = line['baseline']
-    line_height = line['strokeWidth']
 
-
-    bbox_img = page_img.crop( line_bbox )
-    bbox_img_hwc = np.array( bbox_img )
-    bbox_img_hw = ski.color.rgb2gray( bbox_img_hwc )
     leftx, topy = line_bbox[:2]
-    transposed_coordinates = np.array([ (x-leftx, y-topy) for x,y in polygon_coordinates ], dtype='int')[:,::-1]
+    polygon_coordinates = np.array( polygon_coordinates, dtype='int')[:,::-1]
 
     # mean kernel
-    bbox_img_hw = ski.filters.rank.mean( bbox_img_hw, footprint=np.full((10,10),1))
+    boolean_mask = np.array( ski.draw.polygon2mask( img_hw.shape, polygon_coordinates ), dtype='bool')
+    img_mask += boolean_mask
+    print(img_mask.dtype)
 
-    thresh = ski.filters.threshold_otsu( bbox_img_hw )
-    binary_bbox = bbox_img_hw < thresh
-    boolean_mask = ski.draw.polygon2mask( bbox_img_hwc.shape[:2], transposed_coordinates )
-    binarized_line = binary_bbox*boolean_mask
+median_line_height = np.median( [ line['strokeWidth'] for line in line_dict['lines'] ])
 
-    labeled_ccs = ski.measure.label( binarized_line )
-    #img_label_overlay = ski.color.label2rgb( labeled_ccs, bbox_img_hwc, bg_label=0)
+print(binary_img.dtype)
 
-    or region in ski.measure.regionprops( labeled_ccs ):
-        if region.area > line_height**2/4:
+binary_img *= img_mask
+
+labeled_ccs = ski.measure.label( binary_img )
+#img_label_overlay = ski.color.label2rgb( labeled_ccs, img, bg_label=0)
+
+for region in ski.measure.regionprops( labeled_ccs ):
+    if region.area > median_line_height**2/4:
             region_props.append( region.bbox )
 
 
-fig, ax = plt.subplots(figsize=(400,800))
+fig, ax = plt.subplots(figsize=(100,300))
 #ax.imshow( img_label_overlay )
-ax.imshow( page_img )
+ax.imshow( img )
 
-    for region in ski.measure.regionprops( labeled_ccs ):
-        if region.area > median_line_height**2/4:
-            print(region.bbox)
-            miny, minx, maxy, maxx = region.bbox
-            ax.add_patch( mpatches.Rectangle( (minx, miny), maxx-minx, maxy-miny, fill=False,edgecolor='red',linewidth=2))
+regions = ski.measure.regionprops( labeled_ccs )
+for region in regions:
+    if region.area > median_line_height**2/4:
+        #print(region.bbox)
+        miny, minx, maxy, maxx = region.bbox
+        ax.add_patch( mpatches.Rectangle( (minx, miny), maxx-minx, maxy-miny, fill=False,edgecolor='red',linewidth=1))
+print(len(regions), " regions")
+
 
 
 plt.show()
