@@ -60,17 +60,49 @@ fig, ax = plt.subplots(figsize=(100,300))
 #ax.imshow( img_label_overlay )
 ax.imshow( img )
 
-regions = ski.measure.regionprops( labeled_ccs )
-for region in regions:
+regions = sorted( ski.measure.regionprops( labeled_ccs ), key=lambda b: np.mean([b.bbox[1],b.bbox[3]]))
+for r,region in enumerate(regions):
     if region.area > median_line_height**2/4:
         #print(region.bbox)
         miny, minx, maxy, maxx = region.bbox
         ax.add_patch( mpatches.Rectangle( (minx, miny), maxx-minx, maxy-miny, fill=False,edgecolor='red',linewidth=1))
+        plt.text(minx, miny, f'{r}')
 print(len(regions), " regions")
 
 
+#plt.show()
 
-plt.show()
+# starting: each box is its set
+sets = [ [(s_idx,bb)] for s_idx,bb in enumerate(sorted(regions, key=lambda b: np.mean([b.bbox[1],b.bbox[3]]))) ]
+dilation = 0
+changed = True
+while (changed):
+    print([ [ elt[0] for elt in s ] for s in sets ])
+    changed = False
+    updated_sets = []
+    for i,s1 in enumerate(sets):
+        updated_sets.append( s1 )
+        for s2 in sets[i+1:]:
+            s1.x_left, s1.x_right, s1.y_top, s1.y_bottom = s1[0][1].bbox[1], s1[0][1].bbox[3], 
+            s1.x_left, s1.x_right, s1.y_top, s1.y_bottom
+            , s2.y_top = s1[0][1].bbox[3], s2[0][1].bbox[1], s1[0][1].bbox[2] s2[0][1].bbox[0]
+            if x1.x_right >= s2.x_left and (s1.y_bottom >= s2.y_top or s1.y_top <= s2.y_bottom)
+                print(s1[0][0], s1[0][1].bbox,s2[0][0], s2[0][1].bbox, "s1.x_right=", s1[0][1].bbox[3], "s2.x_left=", s2[0][1].bbox[1], "s1.y_bottom=", s1[0][1].bbox[2], "s2.y_top=", s2[0][1].bbox[0])
+                updated_sets.pop()
+                updated_sets.append( s1+s2 )
+                changed = True
+                break # each box intersects with at most one R-neighbor
+    dilation += 1
+    sets = sorted(updated_sets, key=lambda s: np.mean([s[0][1].bbox[1],s[-1][1].bbox[3]])) 
+    #print([ [ elt[0] for elt in s ] for s in sets ])
+    break
+        
+                
+
+
+
+def intersect_x( bbox1, bbox2):
+    return bbox1[3]<=bbox[0]
 
 def projection_method():
 
