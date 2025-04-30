@@ -1,0 +1,13 @@
+mode: train
+data: lines.yaml
+plots: True
+patience: 100
+multi_scale: True
+epochs: 600
+imgsz: (1280,640)
+shear: 10
+scale: 0.5
+batch: 4
+save: True
+project: runs
+line_width: 1

@@ -1,0 +1,8 @@
+path: ./cb_ws/fake_db/yolo
+train: images/train
+val: images/val
+
+# classes
+names:
+  0: word
+
