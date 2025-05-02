@@ -186,7 +186,8 @@ if __name__ == '__main__':
             #print("type(imgs)=", type(imgs))
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
-            loss = sum(model['net'](imgs, targets).values())
+            loss_dict = model['net'](imgs, targets)
+            loss = sum( loss_dict.values())
             
             print('Epoch {}-{}: Training loss: {:.4f}'.format(epoch, batch_index, loss))
             epoch_losses.append( loss.detach() )
@@ -197,14 +198,16 @@ if __name__ == '__main__':
         model['train_epochs'].append( {'loss': mean_loss } )
 
         # validate
-        model['net'].eval()
+        #model['net'].eval()
         validation_losses = []
         batches = iter(dl_val)
         for batch_index in tqdm( range(len( batches ))):
             imgs, targets = next(batches)
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
-            validation_losses.append( np.sum(model['net'](imgs, targets).values()))
+            loss_dict = model['net'](imgs, targets)
+            loss = sum( loss_dict.values()) 
+            validation_losses.append( loss.detach())
         mean_validation_loss = torch.stack( validation_losses).mean().item()    
 
 
