@@ -20,7 +20,9 @@ from PIL import Image
 import skimage as ski
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 
+import sys
 
 
 
@@ -42,22 +44,34 @@ def display_annotated_img( img: Tensor, target: dict, alpha=.4, color='g'):
     plt.show()
 
 
+def split_set( *arrays, test_size=.2, random_state =46):
+    seq = range(len(arrays[0]))
+    train_set = set(random.sample( seq, int(len(arrays[0])*(1-test_size))))
+    test_set = set(seq) - train_set
+    sets = []
+    for a in arrays:
+        sets.extend( [[ a[i] for i in train_set ], [ a[j] for j in test_set ]] )
+    return sets
+
+
 class ChartersDataset(Dataset):
     """
     This class represents a PyTorch Dataset for a collection of images and their annotations.
     The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
     """
-    def __init__(self, img_paths, transforms=None):
+    def __init__(self, img_paths, label_paths, transforms=None):
         """
         Constructor for the Dataset class.
 
         Parameters:
         img_paths (list): List of unique identifiers for images.
+        label_paths (list): List of label paths.
         transforms (callable, optional): Optional transform to be applied on a sample.
         """
         super(Dataset, self).__init__()
         
         self._img_paths = img_paths  # List of image keys
+        self._label_paths = label_paths  # List of image annotation files
         self._transforms = v2.Compose([
             v2.ToImage(),
             v2.Resize([1240,1240]),
@@ -87,11 +101,11 @@ class ChartersDataset(Dataset):
         tuple: A tuple containing the image and its associated target (annotations).
         """
         # Retrieve the key for the image at the specified index
-        img_path = self._img_paths[index] 
+        img_path, label_path = self._img_paths[index], self._label_paths[index]
         # Get the annotations for this image
-        annotation_path = Path(str(img_path).replace('.img.jpg','.lines.gt.json'))
+        label_path = Path(str(img_path).replace('.img.jpg','.lines.gt.json'))
         # Load the image and its target (segmentation masks, bounding boxes and labels)
-        image, target = self._load_image_and_target(img_path, annotation_path)
+        image, target = self._load_image_and_target(img_path, label_path)
         
         # Apply the transformations, if any
         if self._transforms:
@@ -119,7 +133,7 @@ class ChartersDataset(Dataset):
             segdict = json.load( annotation_if )
 
             labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
-            print(type(labels), labels.dtype)
+            #print(type(labels), labels.dtype)
             polygons = [ [ tuple(p) for p in l['coreBoundary']] for l in segdict['lines'] ]
         
             # Convert polygons to mask images
@@ -131,27 +145,76 @@ class ChartersDataset(Dataset):
                 
             return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
 
+
 if __name__ == '__main__':
-    ds = ChartersDataset( list(Path('./dataset').glob('*.jpg')))
 
-    print(ds[5][1]['masks'].shape)
+    imgs = list(Path('./dataset').glob('*.jpg'))
+    lbls = [ str(img_path).replace('.img.jpg', '.lines.gt.json') for img_path in imgs ]
+
+    # split sets
+    imgs_train, imgs_test, lbls_train, lbls_test = split_set( imgs, lbls )
+    imgs_train, imgs_val, lbls_train, lbls_val = split_set( imgs_train, lbls_train )
+    
+
+    ds_train = ChartersDataset( imgs_train, lbls_train )
+    ds_val = ChartersDataset( imgs_val, lbls_val )
+    ds_test = ChartersDataset( imgs_test, lbls_test )
+
+    print(ds_train[5][1]['masks'].shape)
 
 
-    dl = DataLoader( ds, batch_size=2, collate_fn = lambda batch: tuple(zip(*batch)))
+    dl_train = DataLoader( ds_train, batch_size=2, collate_fn = lambda b: tuple(zip(*b)))
+    dl_val = DataLoader( ds_val, batch_size=2, collate_fn = lambda b: tuple(zip(*b)))
 
+    model = {'net': None, 'train_epochs': [] }
 
     # single epoch
-    model = maskrcnn_resnet50_fpn_v2(weights=None, weighs_backbone=None).train()
-    optimizer =torch.optim.AdamW( model.parameters(), lr=5e-4)
+    model['net'] = maskrcnn_resnet50_fpn_v2(weights='DEFAULT')
+    model['net'].cuda()
+    model['net'].train()
+    optimizer =torch.optim.AdamW( model['net'].parameters(), lr=5e-3)
+    max_epochs = 10
     
-    for imgs, targets in dl:
-        inputs = torch.stack( imgs ).to('cuda:0')
-        loss_dict = model(imgs, targets)
-        loss = sum(loss_dict.values())
-        print(loss)
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+   
+    def train_epoch( epoch: int ):
+        
+        epoch_losses = []
+
+        batches = iter(dl_train)
+        for batch_index, sample in enumerate(dl_train):
+            imgs, targets = sample
+            #print("type(imgs)=", type(imgs))
+            imgs = torch.stack(imgs).cuda()
+            targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
+            loss = sum(model['net'](imgs, targets).values())
+            
+            print('Epoch {}-{}: Training loss: {:.4f}'.format(epoch, batch_index, loss))
+            epoch_losses.append( loss.detach() )
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        mean_loss = torch.stack( epoch_losses ).mean().item()
+        model['train_epochs'].append( {'loss': mean_loss } )
+
+        # validate
+        model['net'].eval()
+        validation_losses = []
+        batches = iter(dl_val)
+        for batch_index in tqdm( range(len( batches ))):
+            imgs, targets = next(batches)
+            imgs = torch.stack(imgs).cuda()
+            targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
+            validation_losses.append( np.sum(model['net'](imgs, targets).values()))
+        mean_validation_loss = torch.stack( validation_losses).mean().item()    
 
 
+        model['net'].train()
+
+        print('Epoch {}: Training loss: {:.4f} - Validation loss: {:.4f}'.format(epoch, mean_loss, mean_validation_loss))
+        
+
+
+    for epoch in range( max_epochs ):
+
+        train_epoch( epoch )
 
