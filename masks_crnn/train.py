@@ -13,10 +13,11 @@ from torchvision.models.detection import maskrcnn_resnet50_fpn_v2, MaskRCNN
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torch.utils.tensorboard import SummaryWriter
 
 from tqdm.auto import tqdm
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import skimage as ski
 import numpy as np
 import matplotlib.pyplot as plt
@@ -24,7 +25,59 @@ import random
 
 import sys
 
+def get_n_color_palette(n: int, s=.85, v=.95) -> list:
+    """
+    Generate n well-distributed random colors. Use golden ratio to generate colors from the HSV color
+    space.
 
+    Reference: https://martin.ankerl.com/2009/12/09/how-to-create-random-colors-programmatically/
+
+    Args:
+        n (int): number of color to generate.
+
+    Returns:
+        list: a list of (R,G,B) tuples
+    """
+    golden_ratio_conjugate = 0.618033988749895
+    random.seed(13)
+    h = random.random()
+    palette = np.zeros((1,n,3))
+    for i in range(n):
+        h += golden_ratio_conjugate
+        h %= 1
+        palette[0][i]=(h, s, v)
+    return (ski.color.hsv2rgb( palette )*255).astype('uint8')[0].tolist()
+
+
+def batch_visuals( imgs:list, results: list[dict], color_count=-1, alpha=.4):
+
+    visuals = []
+    imgs = [ img.cpu().numpy() for img in imgs ]
+    masks = [ m.detach().cpu().numpy() for m in [ r['masks'] for r in results] ]
+    masks = [ m * (m>.4) for m in masks ]
+    for img,msk in zip(imgs,masks):
+        bm = np.sum( msk, axis=0).astype('bool')
+        img_complementary = img * ( ~bm + bm * (1-alpha))
+        #print("img_complementary:", img_complementary.shape)
+        if color_count==0:
+            colors = get_n_color_palette( color_count ) if color_count else get_n_color_palette(len( msk ))
+            col_masks = []
+            for c,m in zip(colors,msk):
+                col_masks.append( np.transpose( np.full( img.shape[1::-1] + (3,), c), (2,0,1)) * m.astype('bool'))
+                col_mask = np.sum( np.stack( col_masks), axis=0)
+        else:
+            #RED * BOOL * ALPHA
+            col_canvas = np.full(img.shape[1::-1]+(3,), [0,0,1.0])
+            #print("img:", img.shape)
+            #print("col_canvas:", col_canvas.shape)
+            col_mask = np.transpose( np.full(img.shape[1:]+(3,), [0,0,1.0]),  (2,0,1)) * bm * alpha
+        #print("col_mask:", col_mask.shape)
+        composed_img_array = np.transpose(img_complementary + col_mask, (1,2,0))
+        visuals.append( composed_img_array )
+    batched_visuals = np.transpose( np.stack( visuals ), (0,3,1,2))
+    print("batched_visuals:", batched_visuals.shape)
+    
+    return batched_visuals
 
 def display_annotated_img( img: Tensor, target: dict, alpha=.4, color='g'):
     """ Overlay of instance masks
@@ -32,15 +85,23 @@ def display_annotated_img( img: Tensor, target: dict, alpha=.4, color='g'):
         img (Tensor): (C,H,W) image
         masks (Tensor): (N,H,W) tensor of masks where N=# instances for image
     """
-    masks = target['masks']
-    boxes = target['boxes']
-    bm = torch.sum( masks, axis=0).to(dtype=torch.bool)
-    print(bm.shape)
+    img = img.detach().numpy()
+    masks = target['masks'].detach().numpy()
+    masks = [ m * (m>.5) for m in masks ]
+    boxes = [ [ int(c) for c in box ] for box in target['boxes'].detach().numpy().tolist()]
+    bm = np.sum( masks, axis=0).astype('bool')
     col = {'r': [1.0,0,0], 'g':[0,1.0,0], 'b':[0,0,1.0]}[color]
     # RED * BOOL * ALPHA
-    red_mask = torch.tensor([[col]*img.shape[2]]*img.shape[1]).permute(2,0,1) * bm * alpha
+    red_mask = np.transpose( np.full((img.shape[2],img.shape[1],3), col), (2,0,1)) * bm * alpha
     img_complementary = img * ( ~bm + bm * (1-alpha))
-    plt.imshow( (img_complementary + red_mask ).permute(1,2,0))
+    composed_img_array = np.transpose(img_complementary + red_mask, (1,2,0))
+    pil_img = Image.fromarray( (composed_img_array*255).astype('uint8'))
+    draw = ImageDraw.Draw( pil_img )
+    polygon_boundaries = [[ [box[0],box[0]], [box[0],box[1]], [box[1],box[1]], [box[1],box[0]] ] for box in boxes] 
+    for i,polyg in enumerate(polygon_boundaries):
+        if i%2 != 0:
+            draw.polygon(polyg, outline='blue')
+    plt.imshow( np.array( pil_img ))
     plt.show()
 
 
@@ -74,7 +135,7 @@ class ChartersDataset(Dataset):
         self._label_paths = label_paths  # List of image annotation files
         self._transforms = v2.Compose([
             v2.ToImage(),
-            v2.Resize([1240,1240]),
+            v2.Resize([680,680]),
             v2.RandomHorizontalFlip(p=1),
             v2.SanitizeBoundingBoxes(),
             v2.ToDtype(torch.float32, scale=True),
@@ -142,13 +203,13 @@ class ChartersDataset(Dataset):
         # Generate bounding box annotations from segmentation masks
             bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
             #print(bboxes)
-                
             return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
 
 
 if __name__ == '__main__':
 
-    imgs = list(Path('./dataset').glob('*.jpg'))
+    random.seed(46)
+    imgs = random.sample( list(Path('./dataset').glob('*.jpg')), 20)
     lbls = [ str(img_path).replace('.img.jpg', '.lines.gt.json') for img_path in imgs ]
 
     # split sets
@@ -163,23 +224,55 @@ if __name__ == '__main__':
     print(ds_train[5][1]['masks'].shape)
 
 
-    dl_train = DataLoader( ds_train, batch_size=2, collate_fn = lambda b: tuple(zip(*b)))
-    dl_val = DataLoader( ds_val, batch_size=2, collate_fn = lambda b: tuple(zip(*b)))
+    dl_train = DataLoader( ds_train, batch_size=2, shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
+    dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
 
     model = {'net': None, 'train_epochs': [] }
 
     # single epoch
-    model['net'] = maskrcnn_resnet50_fpn_v2(weights='DEFAULT')
+    resume_file = 'last.pt'
+    model['net']=maskrcnn_resnet50_fpn_v2(weights=None, num_classes=2)
+    if Path(resume_file).exists():
+        model['net'].load_state_dict( torch.load(resume_file, weights_only=True))
+    
     model['net'].cuda()
     model['net'].train()
     optimizer =torch.optim.AdamW( model['net'].parameters(), lr=5e-3)
-    max_epochs = 10
-    
+    max_epochs = 200
+    patience = 50
+    best_loss, best_epoch = 100.0, -1
+
+    writer=SummaryWriter()
+
+    def validate(epoch, ):
+        validation_losses = []
+        batches = iter(dl_val)
+        for batch_index in tqdm( range(len( batches ))):
+            imgs, targets = next(batches)
+            imgs = torch.stack(imgs).cuda()
+            targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
+            loss_dict = model['net'](imgs, targets)
+            loss = sum( loss_dict.values()) 
+            validation_losses.append( loss.detach())
+        mean_validation_loss = torch.stack( validation_losses).mean().item()    
+        writer.add_scalar("Loss/val", mean_validation_loss, epoch)
+        
+        # tensorboard
+        model['net'].eval()
+        net=model['net'].cpu()
+        #inputs = [ ds_val[i][0].cuda() for i in range(2) ]
+        inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), 2) ]
+        predictions = net( inputs )
+        writer.add_images('batch[10]', batch_visuals( inputs, net( inputs)), 0)
+        model['net'].train()
+
+        torch.save(model['net'].state_dict() , 'last.pt')
+
+        return mean_validation_loss
    
     def train_epoch( epoch: int ):
         
         epoch_losses = []
-
         batches = iter(dl_train)
         for batch_index, sample in enumerate(dl_train):
             imgs, targets = sample
@@ -195,29 +288,25 @@ if __name__ == '__main__':
             optimizer.step()
             optimizer.zero_grad()
         mean_loss = torch.stack( epoch_losses ).mean().item()
+
+        writer.add_scalar("Loss/train", mean_loss, epoch)
         model['train_epochs'].append( {'loss': mean_loss } )
 
-        # validate
-        #model['net'].eval()
-        validation_losses = []
-        batches = iter(dl_val)
-        for batch_index in tqdm( range(len( batches ))):
-            imgs, targets = next(batches)
-            imgs = torch.stack(imgs).cuda()
-            targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
-            loss_dict = model['net'](imgs, targets)
-            loss = sum( loss_dict.values()) 
-            validation_losses.append( loss.detach())
-        mean_validation_loss = torch.stack( validation_losses).mean().item()    
-
-
-        model['net'].train()
-
+        mean_validation_loss = validate( epoch )
         print('Epoch {}: Training loss: {:.4f} - Validation loss: {:.4f}'.format(epoch, mean_loss, mean_validation_loss))
-        
+
 
 
     for epoch in range( max_epochs ):
 
-        train_epoch( epoch )
+        validation_loss = train_epoch( epoch )
+        if validation_loss < best_loss:
+            best_loss = validation_loss
+            best_epoch = epoch
+            torch.save( model['net'].state_dict(), 'best.pt')
+        elif epoch - best_epoch > patience:
+            print("No improvement since epoch {}: early exit.".format(epoch))
+            break
 
+    writer.flush()
+    writer.close()
