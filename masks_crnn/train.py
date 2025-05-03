@@ -9,6 +9,7 @@ import torchvision
 from torchvision.tv_tensors import BoundingBoxes, Mask
 import torchvision.transforms.v2 as v2
 
+from torchvision.models.detection import mask_rcnn
 from torchvision.models.detection import maskrcnn_resnet50_fpn_v2, MaskRCNN
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
@@ -24,6 +25,19 @@ import matplotlib.pyplot as plt
 import random
 
 import sys
+import fargv
+
+p = {
+    'max_epoch': 250,
+    'img_paths': list(Path("dataset").glob('*.img.jpg')),
+    'line_segmentation_suffix': ".lines.gt.json",
+    'polygon_type': 'coreBoundary',
+    'lr': 2e-4,
+    'img_size': 1240,
+    'patience': 50,
+}
+
+
 
 def get_n_color_palette(n: int, s=.85, v=.95) -> list:
     """
@@ -49,22 +63,23 @@ def get_n_color_palette(n: int, s=.85, v=.95) -> list:
     return (ski.color.hsv2rgb( palette )*255).astype('uint8')[0].tolist()
 
 
-def batch_visuals( imgs:list, results: list[dict], color_count=-1, alpha=.4):
+def batch_visuals( imgs:list, results: list[dict], threshold=.5, color_count=-1, alpha=.4):
 
     visuals = []
     imgs = [ img.cpu().numpy() for img in imgs ]
     masks = [ m.detach().cpu().numpy() for m in [ r['masks'] for r in results] ]
-    masks = [ m * (m>.4) for m in masks ]
+    masks = [ m * (m>threshold) for m in masks ]
     for img,msk in zip(imgs,masks):
         bm = np.sum( msk, axis=0).astype('bool')
         img_complementary = img * ( ~bm + bm * (1-alpha))
         #print("img_complementary:", img_complementary.shape)
-        if color_count==0:
-            colors = get_n_color_palette( color_count ) if color_count else get_n_color_palette(len( msk ))
-            col_masks = []
+        if color_count>=0:
+            colors = get_n_color_palette( color_count ) if color_count > 0 else get_n_color_palette(len( msk ))
+            col_mask = np.zeros( (3,)+img.shape[1:] )
             for c,m in zip(colors,msk):
-                col_masks.append( np.transpose( np.full( img.shape[1::-1] + (3,), c), (2,0,1)) * m.astype('bool'))
-                col_mask = np.sum( np.stack( col_masks), axis=0)
+                col_mask += np.transpose( np.full( img.shape[1:]+(3,), c), (2,0,1)) * m 
+            col_mask *= alpha
+
         else:
             #RED * BOOL * ALPHA
             col_canvas = np.full(img.shape[1::-1]+(3,), [0,0,1.0])
@@ -75,6 +90,7 @@ def batch_visuals( imgs:list, results: list[dict], color_count=-1, alpha=.4):
         composed_img_array = np.transpose(img_complementary + col_mask, (1,2,0))
         visuals.append( composed_img_array )
     batched_visuals = np.transpose( np.stack( visuals ), (0,3,1,2))
+    len(batched_visuals)
     print("batched_visuals:", batched_visuals.shape)
     
     return batched_visuals
@@ -135,8 +151,8 @@ class ChartersDataset(Dataset):
         self._label_paths = label_paths  # List of image annotation files
         self._transforms = v2.Compose([
             v2.ToImage(),
-            v2.Resize([680,680]),
-            v2.RandomHorizontalFlip(p=1),
+            v2.Resize([args.img_size,args.img_size]),
+            v2.RandomHorizontalFlip(p=.2),
             v2.SanitizeBoundingBoxes(),
             v2.ToDtype(torch.float32, scale=True),
             ])
@@ -208,21 +224,20 @@ class ChartersDataset(Dataset):
 
 if __name__ == '__main__':
 
+
+    args, _ = fargv.fargv( p )
+
     random.seed(46)
-    imgs = random.sample( list(Path('./dataset').glob('*.jpg')), 20)
-    lbls = [ str(img_path).replace('.img.jpg', '.lines.gt.json') for img_path in imgs ]
+    imgs = random.sample( args.img_paths, 100 )
+    lbls = [ str(img_path).replace('.img.jpg', args.line_segmentation_suffix) for img_path in imgs ]
 
     # split sets
     imgs_train, imgs_test, lbls_train, lbls_test = split_set( imgs, lbls )
     imgs_train, imgs_val, lbls_train, lbls_val = split_set( imgs_train, lbls_train )
-    
 
     ds_train = ChartersDataset( imgs_train, lbls_train )
     ds_val = ChartersDataset( imgs_val, lbls_val )
     ds_test = ChartersDataset( imgs_test, lbls_test )
-
-    print(ds_train[5][1]['masks'].shape)
-
 
     dl_train = DataLoader( ds_train, batch_size=2, shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
@@ -231,15 +246,37 @@ if __name__ == '__main__':
 
     # single epoch
     resume_file = 'last.pt'
-    model['net']=maskrcnn_resnet50_fpn_v2(weights=None, num_classes=2)
+
+    #model['net']=maskrcnn_resnet50_fpn_v2(weights=None, num_classes=2)
+
+    from torchvision.models import resnet101, ResNet101_Weights
+    from torch import nn 
+    from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+    from torchvision.models.detection.anchor_utils import AnchorGenerator
+    from torchvision.models.detection.faster_rcnn import _default_anchorgen, RPNHead, FastRCNNConvFCHead
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+    backbone = resnet_fpn_backbone(backbone_name='resnet101', weights=None)#weights=ResNet101_Weights.DEFAULT)
+
+    rpn_anchor_generator = _default_anchorgen()
+    rpn_head = RPNHead(backbone.out_channels, rpn_anchor_generator.num_anchors_per_location()[0], conv_depth=2)
+    box_head = FastRCNNConvFCHead(
+        (backbone.out_channels, 7, 7), [256, 256, 256, 256], [1024], norm_layer=nn.BatchNorm2d
+    )
+
+    model['net'] =  MaskRCNN( backbone=backbone, num_classes=2, 
+            rpn_anchor_generator=rpn_anchor_generator,
+            rpn_head=rpn_head,
+            box_head=box_head,
+            )
+
     if Path(resume_file).exists():
         model['net'].load_state_dict( torch.load(resume_file, weights_only=True))
     
     model['net'].cuda()
     model['net'].train()
-    optimizer =torch.optim.AdamW( model['net'].parameters(), lr=5e-3)
-    max_epochs = 200
-    patience = 50
+    optimizer = torch.optim.AdamW( model['net'].parameters(), lr=args.lr)
+    scheduler = ReduceLROnPlateau( optimizer, patience=10 )
     best_loss, best_epoch = 100.0, -1
 
     writer=SummaryWriter()
@@ -261,9 +298,11 @@ if __name__ == '__main__':
         model['net'].eval()
         net=model['net'].cpu()
         #inputs = [ ds_val[i][0].cuda() for i in range(2) ]
+        random.seed(46)
         inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), 2) ]
         predictions = net( inputs )
-        writer.add_images('batch[10]', batch_visuals( inputs, net( inputs)), 0)
+        writer.add_images('batch[10]', batch_visuals( inputs, net( inputs )), 0)
+        model['net'].cuda()
         model['net'].train()
 
         torch.save(model['net'].state_dict() , 'last.pt')
@@ -294,17 +333,16 @@ if __name__ == '__main__':
 
         mean_validation_loss = validate( epoch )
         print('Epoch {}: Training loss: {:.4f} - Validation loss: {:.4f}'.format(epoch, mean_loss, mean_validation_loss))
+        return mean_validation_loss
 
-
-
-    for epoch in range( max_epochs ):
+    for epoch in range( args.max_epoch ):
 
         validation_loss = train_epoch( epoch )
         if validation_loss < best_loss:
             best_loss = validation_loss
             best_epoch = epoch
             torch.save( model['net'].state_dict(), 'best.pt')
-        elif epoch - best_epoch > patience:
+        elif epoch - best_epoch > args.patience:
             print("No improvement since epoch {}: early exit.".format(epoch))
             break
 
