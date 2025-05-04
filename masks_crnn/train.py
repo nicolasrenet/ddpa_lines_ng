@@ -276,7 +276,7 @@ if __name__ == '__main__':
     model['net'].train()
     optimizer = torch.optim.AdamW( model['net'].parameters(), lr=args.lr)
     scheduler = ReduceLROnPlateau( optimizer, patience=10 )
-    best_loss, best_epoch = 100.0, -1
+    best_loss, best_epoch = np.inf, -1
 
     writer=SummaryWriter()
 
@@ -301,7 +301,7 @@ if __name__ == '__main__':
         random.seed(46)
         inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), args.tensorboard_sample_size) ]
         predictions = net( inputs )
-        writer.add_images('batch[10]', batch_visuals( inputs, net( inputs )), color_count=5)
+        writer.add_images('batch[10]', batch_visuals( inputs, net( inputs ), color_count=5))
         model['net'].cuda()
         model['net'].train()
 
@@ -313,21 +313,20 @@ if __name__ == '__main__':
         
         epoch_losses = []
         batches = iter(dl_train)
-        #print("Epoch {}: ".format(epoch), end='')
+        
         for batch_index, sample in enumerate(pbar := tqdm(dl_train)):
             pbar.set_description(f'Epoch {epoch}')
             imgs, targets = sample
-            #print("type(imgs)=", type(imgs))
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
             loss_dict = model['net'](imgs, targets)
             loss = sum( loss_dict.values())
             
-            #print('Epoch {}-{}: Training loss: {:.4f}'.format(epoch, batch_index, loss))
             epoch_losses.append( loss.detach() )
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+
         mean_training_loss = torch.stack( epoch_losses ).mean().item()
 
         writer.add_scalar("Loss/train", mean_training_loss, epoch)
@@ -338,6 +337,7 @@ if __name__ == '__main__':
 
         mean_training_loss = train_epoch( epoch )
         mean_validation_loss = validate( epoch )
+        scheduler.step( mean_validation_loss )
         model['epochs'].append( {
             'training_loss': mean_training_loss, 
             'validation_loss': mean_validation_loss 
