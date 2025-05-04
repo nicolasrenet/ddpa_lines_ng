@@ -322,7 +322,7 @@ if __name__ == '__main__':
         net=model['net'].cpu()
         inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), args.tensorboard_sample_size) ]
         predictions = net( inputs )
-        writer.add_images('batch[10]', batch_visuals( inputs, net( inputs ), color_count=5))
+        writer.add_images('batch[10]', np.transpose( batch_visuals( inputs, net( inputs ), color_count=5), (0,3,1,2)))
         model['net'].cuda()
         model['net'].train()
    
@@ -350,7 +350,7 @@ if __name__ == '__main__':
         for epoch in range( args.max_epoch ):
 
             mean_training_loss = train_epoch( epoch )
-            mean_validation_loss = validate( epoch )
+            mean_validation_loss = validate()
             torch.save(model['net'].state_dict() , 'last.pt')
 
             update_tensorboard(epoch, mean_training_loss, mean_validation_loss)
