@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 
+import sys
 import json
 from pathlib import Path
+
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
-import torchvision
-from torchvision.tv_tensors import BoundingBoxes, Mask
-import torchvision.transforms.v2 as v2
+from torch import nn 
 
+import torchvision
+import torchvision.transforms.v2 as v2
+from torchvision.tv_tensors import BoundingBoxes, Mask
 from torchvision.models.detection import mask_rcnn
 from torchvision.models.detection import maskrcnn_resnet50_fpn_v2, MaskRCNN
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
-from torch.utils.tensorboard import SummaryWriter
+from torchvision.models import resnet101, ResNet101_Weights
+from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from torchvision.models.detection.anchor_utils import AnchorGenerator
+from torchvision.models.detection.faster_rcnn import _default_anchorgen, RPNHead, FastRCNNConvFCHead
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from tqdm.auto import tqdm
 
+from torch.utils.tensorboard import SummaryWriter
 from PIL import Image, ImageDraw
 import skimage as ski
 import numpy as np
@@ -34,7 +40,9 @@ p = {
     'polygon_type': 'coreBoundary',
     'lr': 2e-4,
     'img_size': 1240,
+    'batch_size': 8,
     'patience': 50,
+    'tensorboard_sample_size': 2,
 }
 
 
@@ -79,7 +87,6 @@ def batch_visuals( imgs:list, results: list[dict], threshold=.5, color_count=-1,
             for c,m in zip(colors,msk):
                 col_mask += np.transpose( np.full( img.shape[1:]+(3,), c), (2,0,1)) * m 
             col_mask *= alpha
-
         else:
             #RED * BOOL * ALPHA
             col_canvas = np.full(img.shape[1::-1]+(3,), [0,0,1.0])
@@ -239,22 +246,16 @@ if __name__ == '__main__':
     ds_val = ChartersDataset( imgs_val, lbls_val )
     ds_test = ChartersDataset( imgs_test, lbls_test )
 
-    dl_train = DataLoader( ds_train, batch_size=2, shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
+    dl_train = DataLoader( ds_train, batch_size=args.batch_size, shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
 
-    model = {'net': None, 'train_epochs': [] }
+    model = {'net': None, 'epochs': [], 'best': {} }
 
     # single epoch
     resume_file = 'last.pt'
 
     #model['net']=maskrcnn_resnet50_fpn_v2(weights=None, num_classes=2)
 
-    from torchvision.models import resnet101, ResNet101_Weights
-    from torch import nn 
-    from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
-    from torchvision.models.detection.anchor_utils import AnchorGenerator
-    from torchvision.models.detection.faster_rcnn import _default_anchorgen, RPNHead, FastRCNNConvFCHead
-    from torch.optim.lr_scheduler import ReduceLROnPlateau
 
     backbone = resnet_fpn_backbone(backbone_name='resnet101', weights=None)#weights=ResNet101_Weights.DEFAULT)
 
@@ -284,7 +285,8 @@ if __name__ == '__main__':
     def validate(epoch, ):
         validation_losses = []
         batches = iter(dl_val)
-        for batch_index in tqdm( range(len( batches ))):
+        for batch_index in (pbar := tqdm( range(len( batches )))):
+            pbar.set_description('Validate')
             imgs, targets = next(batches)
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
@@ -299,7 +301,7 @@ if __name__ == '__main__':
         net=model['net'].cpu()
         #inputs = [ ds_val[i][0].cuda() for i in range(2) ]
         random.seed(46)
-        inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), 2) ]
+        inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), args.tensorboard_sample_size) ]
         predictions = net( inputs )
         writer.add_images('batch[10]', batch_visuals( inputs, net( inputs )), 0)
         model['net'].cuda()
@@ -313,7 +315,9 @@ if __name__ == '__main__':
         
         epoch_losses = []
         batches = iter(dl_train)
-        for batch_index, sample in enumerate(dl_train):
+        #print("Epoch {}: ".format(epoch), end='')
+        for batch_index, sample in enumerate(pbar := tqdm(dl_train)):
+            pbar.set_description(f'Epoch {epoch}')
             imgs, targets = sample
             #print("type(imgs)=", type(imgs))
             imgs = torch.stack(imgs).cuda()
@@ -321,29 +325,37 @@ if __name__ == '__main__':
             loss_dict = model['net'](imgs, targets)
             loss = sum( loss_dict.values())
             
-            print('Epoch {}-{}: Training loss: {:.4f}'.format(epoch, batch_index, loss))
+            #print('Epoch {}-{}: Training loss: {:.4f}'.format(epoch, batch_index, loss))
             epoch_losses.append( loss.detach() )
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-        mean_loss = torch.stack( epoch_losses ).mean().item()
+        mean_training_loss = torch.stack( epoch_losses ).mean().item()
 
-        writer.add_scalar("Loss/train", mean_loss, epoch)
-        model['train_epochs'].append( {'loss': mean_loss } )
+        writer.add_scalar("Loss/train", mean_training_loss, epoch)
 
-        mean_validation_loss = validate( epoch )
-        print('Epoch {}: Training loss: {:.4f} - Validation loss: {:.4f}'.format(epoch, mean_loss, mean_validation_loss))
-        return mean_validation_loss
+        return mean_training_loss
 
     for epoch in range( args.max_epoch ):
 
-        validation_loss = train_epoch( epoch )
-        if validation_loss < best_loss:
-            best_loss = validation_loss
+        mean_training_loss = train_epoch( epoch )
+        mean_validation_loss = validate( epoch )
+        model['epochs'].append( {
+            'training_loss': mean_training_loss, 
+            'validation_loss': mean_validation_loss 
+        } )
+        if mean_validation_loss < best_loss:
+            best_loss = mean_validation_loss
             best_epoch = epoch
+            model['best']={'epoch': best_epoch, 'loss': best_loss}
             torch.save( model['net'].state_dict(), 'best.pt')
-        elif epoch - best_epoch > args.patience:
-            print("No improvement since epoch {}: early exit.".format(epoch))
+        print('Training loss: {:.4f} - Validation loss: {:.4f} - Best epoch: {} (loss={:.4f})'.format(
+            mean_training_loss, 
+            mean_validation_loss, 
+            model['best']['epoch'], 
+            model['best']['loss']))
+        if epoch - best_epoch > args.patience:
+            print("No improvement since epoch {}: early exit.".format(model['best']['epoch']))
             break
 
     writer.flush()
