@@ -36,6 +36,7 @@ import fargv
 p = {
     'max_epoch': 250,
     'img_paths': list(Path("dataset").glob('*.img.jpg')),
+    'train_set_limit': 0,
     'line_segmentation_suffix': ".lines.gt.json",
     'polygon_type': 'coreBoundary',
     'lr': 2e-4,
@@ -45,6 +46,7 @@ p = {
     'tensorboard_sample_size': 2,
     'mode': ('train','validate'),
     'weight_file': 'last.pt',
+    'scheduler': 0,
 }
 
 
@@ -130,6 +132,7 @@ def display_annotated_img( img: Tensor, target: dict, alpha=.4, color='g'):
 
 
 def split_set( *arrays, test_size=.2, random_state =46):
+    random.seed( random_state)
     seq = range(len(arrays[0]))
     train_set = set(random.sample( seq, int(len(arrays[0])*(1-test_size))))
     test_set = set(seq) - train_set
@@ -271,7 +274,7 @@ if __name__ == '__main__':
     args, _ = fargv.fargv( p )
 
     random.seed(46)
-    imgs = random.sample( args.img_paths, 100 )
+    imgs = random.sample( args.img_paths, args.train_set_limit) if args.train_set_limit else args.img_paths
     lbls = [ str(img_path).replace('.img.jpg', args.line_segmentation_suffix) for img_path in imgs ]
 
     # split sets
@@ -352,7 +355,8 @@ if __name__ == '__main__':
 
             update_tensorboard(epoch, mean_training_loss, mean_validation_loss)
 
-            scheduler.step( mean_validation_loss )
+            if args.scheduler:
+                scheduler.step( mean_validation_loss )
             model['epochs'].append( {
                 'training_loss': mean_training_loss, 
                 'validation_loss': mean_validation_loss 
