@@ -78,27 +78,25 @@ def batch_visuals( imgs:list, results: list[dict], threshold=.5, color_count=-1,
     masks = [ m.detach().cpu().numpy() for m in [ r['masks'] for r in results] ]
     masks = [ m * (m>threshold) for m in masks ]
     for img,msk in zip(imgs,masks):
-        bm = np.sum( msk, axis=0).astype('bool')
+        # (C,H,W) -> (H,W,C)
+        bm = np.transpose( np.sum( msk, axis=0).astype('bool'), (1,2,0))
+        img = np.transpose( img, (1,2,0))
         img_complementary = img * ( ~bm + bm * (1-alpha))
-        #print("img_complementary:", img_complementary.shape)
+        col_msk = None
         if color_count>=0:
-            colors = get_n_color_palette( color_count ) if color_count > 0 else get_n_color_palette(len( msk ))
-            col_mask = np.zeros( (3,)+img.shape[1:] )
-            for c,m in zip(colors,msk):
-                col_mask += np.transpose( np.full( img.shape[1:]+(3,), c), (2,0,1)) * m 
-            col_mask *= alpha
+            labeled_msk = ski.measure.label( bm, connectivity=1)
+            colors = get_n_color_palette( color_count ) if color_count > 0 else get_n_color_palette( np.max(labeled_msk))
+            col_msk = np.zeros( img.shape, dtype=img.dtype )
+            for l in range(1, np.max(labeled_msk)+1):
+                col = np.array(colors[l % len(colors) ])
+                col_msk += (labeled_msk==l) * (col/255.0)
+            col_msk *= alpha
         else:
-            #RED * BOOL * ALPHA
-            col_canvas = np.full(img.shape[1::-1]+(3,), [0,0,1.0])
-            #print("img:", img.shape)
-            #print("col_canvas:", col_canvas.shape)
-            col_mask = np.transpose( np.full(img.shape[1:]+(3,), [0,0,1.0]),  (2,0,1)) * bm * alpha
-        #print("col_mask:", col_mask.shape)
-        composed_img_array = np.transpose(img_complementary + col_mask, (1,2,0))
+            # RED * BOOL * ALPHA
+            col_msk = np.full(img.shape, [0,0,1.0]) * bm * alpha
+        composed_img_array = img_complementary + col_msk
         visuals.append( composed_img_array )
     batched_visuals = np.transpose( np.stack( visuals ), (0,3,1,2))
-    len(batched_visuals)
-    print("batched_visuals:", batched_visuals.shape)
     
     return batched_visuals
 
@@ -303,7 +301,7 @@ if __name__ == '__main__':
         random.seed(46)
         inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), args.tensorboard_sample_size) ]
         predictions = net( inputs )
-        writer.add_images('batch[10]', batch_visuals( inputs, net( inputs )), 0)
+        writer.add_images('batch[10]', batch_visuals( inputs, net( inputs )), color_count=5)
         model['net'].cuda()
         model['net'].train()
 
