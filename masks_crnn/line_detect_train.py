@@ -43,6 +43,8 @@ p = {
     'batch_size': 8,
     'patience': 50,
     'tensorboard_sample_size': 2,
+    'mode': ('train','validate'),
+    'weight_file': 'last.pt',
 }
 
 
@@ -95,8 +97,9 @@ def batch_visuals( imgs:list, results: list[dict], threshold=.5, color_count=-1,
             # RED * BOOL * ALPHA
             col_msk = np.full(img.shape, [0,0,1.0]) * bm * alpha
         composed_img_array = img_complementary + col_msk
+        # Combination: (H,W,C)
         visuals.append( composed_img_array )
-    batched_visuals = np.transpose( np.stack( visuals ), (0,3,1,2))
+    batched_visuals = np.stack( visuals )#, (0,3,1,2))
     
     return batched_visuals
 
@@ -213,22 +216,57 @@ class ChartersDataset(Dataset):
 
         with open( annotation_path, 'r') as annotation_if:
             segdict = json.load( annotation_if )
-
             labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
             #print(type(labels), labels.dtype)
-            polygons = [ [ tuple(p) for p in l['coreBoundary']] for l in segdict['lines'] ]
-        
+            polygons = [ [ tuple(p) for p in l[args.polygon_type]] for l in segdict['lines'] ]
             # Convert polygons to mask images
             masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
-
-        # Generate bounding box annotations from segmentation masks
+            # Generate bounding box annotations from segmentation masks
             bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
-            #print(bboxes)
             return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
 
+def build_nn( bb='resnet101'):
 
+    if bb=='resnet50':
+        return maskrcnn_resnet50_fpn_v2(weights=None, num_classes=2)
+        
+    backbone = resnet_fpn_backbone(backbone_name='resnet101', weights=None)#weights=ResNet101_Weights.DEFAULT)
+    rpn_anchor_generator = _default_anchorgen()
+    rpn_head = RPNHead(backbone.out_channels, rpn_anchor_generator.num_anchors_per_location()[0], conv_depth=2)
+    box_head = FastRCNNConvFCHead(
+        (backbone.out_channels, 7, 7), [256, 256, 256, 256], [1024], norm_layer=nn.BatchNorm2d
+    )
+    return MaskRCNN( 
+            backbone=backbone, num_classes=2,
+            rpn_anchor_generator=rpn_anchor_generator,
+            rpn_head=rpn_head,
+            box_head=box_head,)
+
+
+def predict( imgs: Path, weight_file='best.pt' ):
+
+    args, _ = fargv.fargv( p )
+
+    model = build_nn()
+    if weight_file is None:
+        return []
+    if not Path(weight_file).exists():
+        return []
+
+    model.load_state_dict( torch.load(weight_file, weights_only=True, map_location=torch.device('cpu')))
+    model.eval().cpu()
+    
+    tsf = v2.Compose([
+        v2.ToImage(),
+        v2.Resize([args.img_size,args.img_size]),
+        v2.ToDtype(torch.float32, scale=True),
+    ])
+    imgs = [ tsf( Image.open(img).convert('RGB')) for img in imgs ]
+    return (imgs, model( imgs ))
+    
+
+### Training 
 if __name__ == '__main__':
-
 
     args, _ = fargv.fargv( p )
 
@@ -248,29 +286,10 @@ if __name__ == '__main__':
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
 
     model = {'net': None, 'epochs': [], 'best': {} }
+    model['net'] = build_nn()
 
-    # single epoch
-    resume_file = 'last.pt'
-
-    #model['net']=maskrcnn_resnet50_fpn_v2(weights=None, num_classes=2)
-
-
-    backbone = resnet_fpn_backbone(backbone_name='resnet101', weights=None)#weights=ResNet101_Weights.DEFAULT)
-
-    rpn_anchor_generator = _default_anchorgen()
-    rpn_head = RPNHead(backbone.out_channels, rpn_anchor_generator.num_anchors_per_location()[0], conv_depth=2)
-    box_head = FastRCNNConvFCHead(
-        (backbone.out_channels, 7, 7), [256, 256, 256, 256], [1024], norm_layer=nn.BatchNorm2d
-    )
-
-    model['net'] =  MaskRCNN( backbone=backbone, num_classes=2, 
-            rpn_anchor_generator=rpn_anchor_generator,
-            rpn_head=rpn_head,
-            box_head=box_head,
-            )
-
-    if Path(resume_file).exists():
-        model['net'].load_state_dict( torch.load(resume_file, weights_only=True))
+    if args.weight_file is not None and Path(args.weight_file).exists():
+        model['net'].load_state_dict( torch.load(args.weight_file, weights_only=True))
     
     model['net'].cuda()
     model['net'].train()
@@ -280,7 +299,7 @@ if __name__ == '__main__':
 
     writer=SummaryWriter()
 
-    def validate(epoch, ):
+    def validate():
         validation_losses = []
         batches = iter(dl_val)
         for batch_index in (pbar := tqdm( range(len( batches )))):
@@ -291,23 +310,18 @@ if __name__ == '__main__':
             loss_dict = model['net'](imgs, targets)
             loss = sum( loss_dict.values()) 
             validation_losses.append( loss.detach())
-        mean_validation_loss = torch.stack( validation_losses).mean().item()    
-        writer.add_scalar("Loss/val", mean_validation_loss, epoch)
+        return torch.stack( validation_losses).mean().item()    
         
-        # tensorboard
+    def update_tensorboard(epoch, training_loss, validation_loss):
+        writer.add_scalar("Loss/train", training_loss, epoch)
+        writer.add_scalar("Loss/val", validation_loss, epoch)
         model['net'].eval()
         net=model['net'].cpu()
-        #inputs = [ ds_val[i][0].cuda() for i in range(2) ]
-        random.seed(46)
         inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), args.tensorboard_sample_size) ]
         predictions = net( inputs )
         writer.add_images('batch[10]', batch_visuals( inputs, net( inputs ), color_count=5))
         model['net'].cuda()
         model['net'].train()
-
-        torch.save(model['net'].state_dict() , 'last.pt')
-
-        return mean_validation_loss
    
     def train_epoch( epoch: int ):
         
@@ -327,34 +341,39 @@ if __name__ == '__main__':
             optimizer.step()
             optimizer.zero_grad()
 
-        mean_training_loss = torch.stack( epoch_losses ).mean().item()
+        return torch.stack( epoch_losses ).mean().item()
 
-        writer.add_scalar("Loss/train", mean_training_loss, epoch)
+    if args.mode == 'train':
+        for epoch in range( args.max_epoch ):
 
-        return mean_training_loss
+            mean_training_loss = train_epoch( epoch )
+            mean_validation_loss = validate( epoch )
+            torch.save(model['net'].state_dict() , 'last.pt')
 
-    for epoch in range( args.max_epoch ):
+            update_tensorboard(epoch, mean_training_loss, mean_validation_loss)
 
-        mean_training_loss = train_epoch( epoch )
-        mean_validation_loss = validate( epoch )
-        scheduler.step( mean_validation_loss )
-        model['epochs'].append( {
-            'training_loss': mean_training_loss, 
-            'validation_loss': mean_validation_loss 
-        } )
-        if mean_validation_loss < best_loss:
-            best_loss = mean_validation_loss
-            best_epoch = epoch
-            model['best']={'epoch': best_epoch, 'loss': best_loss}
-            torch.save( model['net'].state_dict(), 'best.pt')
-        print('Training loss: {:.4f} - Validation loss: {:.4f} - Best epoch: {} (loss={:.4f})'.format(
-            mean_training_loss, 
-            mean_validation_loss, 
-            model['best']['epoch'], 
-            model['best']['loss']))
-        if epoch - best_epoch > args.patience:
-            print("No improvement since epoch {}: early exit.".format(model['best']['epoch']))
-            break
+            scheduler.step( mean_validation_loss )
+            model['epochs'].append( {
+                'training_loss': mean_training_loss, 
+                'validation_loss': mean_validation_loss 
+            } )
+            if mean_validation_loss < best_loss:
+                best_loss = mean_validation_loss
+                best_epoch = epoch
+                model['best']={'epoch': best_epoch, 'loss': best_loss}
+                torch.save( model['net'].state_dict(), 'best.pt')
+            print('Training loss: {:.4f} (lr={}) - Validation loss: {:.4f} - Best epoch: {} (loss={:.4f})'.format(
+                mean_training_loss, 
+                scheduler.get_last_lr()[0],
+                mean_validation_loss, 
+                model['best']['epoch'], 
+                model['best']['loss']))
+            if epoch - best_epoch > args.patience:
+                print("No improvement since epoch {}: early exit.".format(model['best']['epoch']))
+                break
+    elif args.mode == 'validate':
+        mean_validation_loss = validate(-1)
+        print('Validation loss: {:.4f}'.format(mean_validation_loss))
 
     writer.flush()
     writer.close()
