@@ -6,7 +6,6 @@ TODO:
 
 + time estimate
 + visuals: heatmaps, boxes
-+ save model parameters
 
 
 """
@@ -56,11 +55,12 @@ p = {
     'patience': 50,
     'tensorboard_sample_size': 2,
     'mode': ('train','validate'),
-    'weight_file': 'last.pt',
+    'weight_file': None,
     'scheduler': 0,
+    'reset_epochs': False,
+    'resume_file': 'last.mlmodel',
+    'dry_run': False,
 }
-
-
 
 def get_n_color_palette(n: int, s=.85, v=.95) -> list:
     """
@@ -173,7 +173,7 @@ class ChartersDataset(Dataset):
         self._label_paths = label_paths  # List of image annotation files
         self._transforms = v2.Compose([
             v2.ToImage(),
-            v2.Resize([args.img_size,args.img_size]),
+            v2.Resize([hyper_params['img_size'],hyper_params['img_size']]),
             v2.RandomHorizontalFlip(p=.2),
             v2.SanitizeBoundingBoxes(),
             v2.ToDtype(torch.float32, scale=True),
@@ -232,7 +232,7 @@ class ChartersDataset(Dataset):
             segdict = json.load( annotation_if )
             labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
             #print(type(labels), labels.dtype)
-            polygons = [ [ tuple(p) for p in l[args.polygon_type]] for l in segdict['lines'] ]
+            polygons = [ [ tuple(p) for p in l[hyper_params['polygon_type']]] for l in segdict['lines'] ]
             # Convert polygons to mask images
             masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
             # Generate bounding box annotations from segmentation masks
@@ -272,20 +272,70 @@ def predict( imgs: Path, weight_file='best.pt' ):
     
     tsf = v2.Compose([
         v2.ToImage(),
-        v2.Resize([args.img_size,args.img_size]),
+        v2.Resize([ hyper_params['img_size'],hyper_params['args.img_size']]),
         v2.ToDtype(torch.float32, scale=True),
     ])
     imgs = [ tsf( Image.open(img).convert('RGB')) for img in imgs ]
     return (imgs, model( imgs ))
     
 
+class SegModel():
+
+    def __init__(self, hyper_params={}):
+        self.net = build_nn()
+        self.epochs = []
+        self.hyper_parameters = hyper_params
+
+    def save( self, file_name ):
+        state_dict = self.net.state_dict()
+        state_dict['epochs'] = self.epochs
+        state_dict['hyper_parameters']=self.hyper_parameters
+        torch.save( state_dict, file_name )
+
+    @staticmethod
+    def resume(file_name, reset_epochs=False, **kwargs):
+        if Path(file_name).exists():
+            state_dict = torch.load(file_name, map_location="cpu")
+            epochs = state_dict["epochs"]
+            del state_dict["epochs"]
+            hyper_parameters = state_dict["hyper_parameters"]
+            del state_dict['hyper_parameters']
+
+            model = SegModel()
+            model.net.load_state_dict( state_dict )
+
+            if not reset_epochs:
+                model.epochs = epochs
+                model.hyper_parameters = hyper_parameters
+            model.net.train()
+            model.net.cuda()
+            return model
+        return SegModel(**kwargs)
+
+
 ### Training 
 if __name__ == '__main__':
 
     args, _ = fargv.fargv( p )
 
+    hyper_params={ varname:v for varname,v in vars(args).items() if varname in ('img_size', 'batch_size', 'patience', 'polygon_type', 'train_set_limit', 'lr','scheduler','max_epoch')}
+
+    model = SegModel()
+
+    # loading weights only
+    if args.weight_file is not None and Path(args.weight_file).exists():
+        print('Loading weights from {}'.format( args.weight_file))
+        model.net.load_state_dict( torch.load(args.weight_file, weights_only=True))
+    # resuming from dictionary
+    elif args.resume_file is not None and Path(args.resume_file).exists():
+        print('Loading model parameters from resume file {}'.format(args.resume_file))
+        model = SegModel.resume( args.resume_file ) # reload hyper-parameters from there
+        hyper_params.update( model.hyper_parameters )
+
+    model.hyper_parameters = hyper_params
+            
     random.seed(46)
-    imgs = random.sample( args.img_paths, args.train_set_limit) if args.train_set_limit else args.img_paths
+    imgs = random.sample( args.img_paths, hyper_params['train_set_limit']) if hyper_params['train_set_limit'] else args.img_paths
     lbls = [ str(img_path).replace('.img.jpg', args.line_segmentation_suffix) for img_path in imgs ]
 
     # split sets
@@ -296,20 +346,15 @@ if __name__ == '__main__':
     ds_val = ChartersDataset( imgs_val, lbls_val )
     ds_test = ChartersDataset( imgs_test, lbls_test )
 
-    dl_train = DataLoader( ds_train, batch_size=args.batch_size, shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
+    dl_train = DataLoader( ds_train, batch_size=hyper_params['batch_size'], shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
 
-    model = {'net': None, 'epochs': [], 'best': {} }
-    model['net'] = build_nn()
-
-    if args.weight_file is not None and Path(args.weight_file).exists():
-        model['net'].load_state_dict( torch.load(args.weight_file, weights_only=True))
-    
-    model['net'].cuda()
-    model['net'].train()
-    optimizer = torch.optim.AdamW( model['net'].parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW( model.net.parameters(), lr=hyper_params['lr'])
     scheduler = ReduceLROnPlateau( optimizer, patience=10 )
     best_loss, best_epoch = np.inf, -1
+    if model.epochs:
+        best_loss,  best_epoch = min([ (i, ep['validation_loss']) for i,ep in enumerate(model.epochs) ], key=lambda t: t[1])
+    print(best_loss, best_epoch)
 
     writer=SummaryWriter()
 
@@ -321,7 +366,7 @@ if __name__ == '__main__':
             imgs, targets = next(batches)
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
-            loss_dict = model['net'](imgs, targets)
+            loss_dict = model.net(imgs, targets)
             loss = sum( loss_dict.values()) 
             validation_losses.append( loss.detach())
         return torch.stack( validation_losses).mean().item()    
@@ -329,14 +374,14 @@ if __name__ == '__main__':
     def update_tensorboard(epoch, training_loss, validation_loss):
         writer.add_scalar("Loss/train", training_loss, epoch)
         writer.add_scalar("Loss/val", validation_loss, epoch)
-        model['net'].eval()
-        net=model['net'].cpu()
+        model.net.eval()
+        net=model.net.cpu()
         inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), args.tensorboard_sample_size) ]
         predictions = net( inputs )
         # (H,W,C) -> (C,H,W)
-        writer.add_images('batch[10]', np.transpose( batch_visuals( inputs, net( inputs ), color_count=5), (0,3,1,2)))
-        model['net'].cuda()
-        model['net'].train()
+        #writer.add_images('batch[10]', np.transpose( batch_visuals( inputs, net( inputs ), color_count=5), (0,3,1,2)))
+        model.net.cuda()
+        model.net.train()
    
     def train_epoch( epoch: int ):
         
@@ -348,7 +393,7 @@ if __name__ == '__main__':
             imgs, targets = sample
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
-            loss_dict = model['net'](imgs, targets)
+            loss_dict = model.net(imgs, targets)
             loss = sum( loss_dict.values())
             
             epoch_losses.append( loss.detach() )
@@ -359,33 +404,43 @@ if __name__ == '__main__':
         return torch.stack( epoch_losses ).mean().item()
 
     if args.mode == 'train':
-        for epoch in range( args.max_epoch ):
+        
+        model.net.cuda()
+        model.net.train()
+            
+        epoch_start = len( model.epochs )
+        if epoch_start > 0:
+            print(f"Resuming training at epoch {epoch_start}.")
+
+        for epoch in range( epoch_start, 0 if args.dry_run else hyper_params['max_epoch'] ):
 
             mean_training_loss = train_epoch( epoch )
             mean_validation_loss = validate()
-            torch.save(model['net'].state_dict() , 'last.pt')
 
             update_tensorboard(epoch, mean_training_loss, mean_validation_loss)
 
-            if args.scheduler:
+            if hyper_params['scheduler']:
                 scheduler.step( mean_validation_loss )
-            model['epochs'].append( {
+            model.epochs.append( {
                 'training_loss': mean_training_loss, 
                 'validation_loss': mean_validation_loss 
             } )
+            torch.save(model.net.state_dict() , 'last.pt')
+            model.save('last.mlmodel')
+
             if mean_validation_loss < best_loss:
                 best_loss = mean_validation_loss
                 best_epoch = epoch
-                model['best']={'epoch': best_epoch, 'loss': best_loss}
-                torch.save( model['net'].state_dict(), 'best.pt')
+                torch.save( model.net.state_dict(), 'best.pt')
+                model.save( 'best.mlmodel' )
             print('Training loss: {:.4f} (lr={}) - Validation loss: {:.4f} - Best epoch: {} (loss={:.4f})'.format(
                 mean_training_loss, 
                 scheduler.get_last_lr()[0],
                 mean_validation_loss, 
-                model['best']['epoch'], 
-                model['best']['loss']))
-            if epoch - best_epoch > args.patience:
-                print("No improvement since epoch {}: early exit.".format(model['best']['epoch']))
+                best_epoch,
+                best_loss,))
+            if epoch - best_epoch > hyper_params['patience']:
+                print("No improvement since epoch {}: early exit.".format(best_epoch))
                 break
     elif args.mode == 'validate':
         mean_validation_loss = validate(-1)
