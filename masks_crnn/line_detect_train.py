@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""
+
+
+TODO:
+
++ time estimate
++ visuals: heatmaps, boxes
++ save model parameters
+
+
+"""
 
 import sys
 import json
@@ -99,7 +110,7 @@ def batch_visuals( imgs:list, results: list[dict], threshold=.5, color_count=-1,
             # RED * BOOL * ALPHA
             col_msk = np.full(img.shape, [0,0,1.0]) * bm * alpha
         composed_img_array = img_complementary + col_msk
-        # Combination: (H,W,C)
+        # Combination: (H,W,C), i.e. fit for image viewers and plots
         visuals.append( composed_img_array )
     batched_visuals = np.stack( visuals )#, (0,3,1,2))
     
@@ -322,6 +333,7 @@ if __name__ == '__main__':
         net=model['net'].cpu()
         inputs = [ ds_val[i][0].cpu() for i in random.sample( range( len(ds_val)), args.tensorboard_sample_size) ]
         predictions = net( inputs )
+        # (H,W,C) -> (C,H,W)
         writer.add_images('batch[10]', np.transpose( batch_visuals( inputs, net( inputs ), color_count=5), (0,3,1,2)))
         model['net'].cuda()
         model['net'].train()
