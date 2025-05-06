@@ -87,20 +87,46 @@ def get_n_color_palette(n: int, s=.85, v=.95) -> list:
         palette[0][i]=(h, s, v)
     return (ski.color.hsv2rgb( palette )*255).astype('uint8')[0].tolist()
 
+def display_mask_heatmaps( masks: Tensor ):
+    """ Display heapmap for the combined page masks (sum over boxes).
+    """
+    plt.imshow(torch.sum(masks, axis=0).permute(1,2,0).detach().numpy())
+    plt.show()
 
-def batch_visuals( imgs:list, results: list[dict], threshold=.5, color_count=-1, alpha=.4):
+def batch_visuals( imgs:list[Tensor], results: list[dict], threshold=.2, color_count=-1, alpha=.4):
+    """
+    Given a list of image tensors and a list of prediction dictionaries, returns page images
+    with mask overlays.
+    Note: actually more than a mere visualization - a preview of a crude post-processing 
+    step that includes:
+
+    - thresholding 
+    - merging overlapping masks
+    - (optional) line labeling
+
+    Args:
+        imgs (list[Tensor]): a list of image tensors.
+        results (list[dict]): a list of predictions, i.e. dictionaries of the form 
+            `{'masks': ..., 'boxes': ..., 'scores': ... }`
+    Returns:
+        list(np.array): a list of arrays (HWC)
+    """
 
     visuals = []
     imgs = [ img.cpu().numpy() for img in imgs ]
-    masks = [ m.detach().cpu().numpy() for m in [ r['masks'] for r in results] ]
-    masks = [ m * (m>threshold) for m in masks ]
+    # filter masks based on box scores 
+    masks = [ m.detach().cpu().numpy() for m in [ r['masks'][r['scores']>.6] for r in results] ]
+    
+    # thresholding
+    masks = [ m * (m>threshold) for m in masks ] 
     for img,msk in zip(imgs,masks):
-        # (C,H,W) -> (H,W,C)
+        # 1. merging [sum()] 2.(C,H,W) -> (H,W,C)
         bm = np.transpose( np.sum( msk, axis=0).astype('bool'), (1,2,0))
         img = np.transpose( img, (1,2,0))
         img_complementary = img * ( ~bm + bm * (1-alpha))
         col_msk = None
         if color_count>=0:
+            # one color per connected component
             labeled_msk = ski.measure.label( bm, connectivity=1)
             colors = get_n_color_palette( color_count ) if color_count > 0 else get_n_color_palette( np.max(labeled_msk))
             col_msk = np.zeros( img.shape, dtype=img.dtype )
@@ -108,8 +134,9 @@ def batch_visuals( imgs:list, results: list[dict], threshold=.5, color_count=-1,
                 col = np.array(colors[l % len(colors) ])
                 col_msk += (labeled_msk==l) * (col/255.0)
             col_msk *= alpha
+        # single color
         else:
-            # RED * BOOL * ALPHA
+            # BLUE * BOOL * ALPHA
             col_msk = np.full(img.shape, [0,0,1.0]) * bm * alpha
         composed_img_array = img_complementary + col_msk
         # Combination: (H,W,C), i.e. fit for image viewers and plots
@@ -119,7 +146,7 @@ def batch_visuals( imgs:list, results: list[dict], threshold=.5, color_count=-1,
     return batched_visuals
 
 def display_annotated_img( img: Tensor, target: dict, alpha=.4, color='g'):
-    """ Overlay of instance masks
+    """ Overlay of instance masks.
     Args:
         img (Tensor): (C,H,W) image
         masks (Tensor): (N,H,W) tensor of masks where N=# instances for image
@@ -165,9 +192,9 @@ class ChartersDataset(Dataset):
         Constructor for the Dataset class.
 
         Parameters:
-        img_paths (list): List of unique identifiers for images.
-        label_paths (list): List of label paths.
-        transforms (callable, optional): Optional transform to be applied on a sample.
+            img_paths (list): List of unique identifiers for images.
+            label_paths (list): List of label paths.
+            transforms (callable, optional): Optional transform to be applied on a sample.
         """
         super(Dataset, self).__init__()
         
@@ -187,7 +214,7 @@ class ChartersDataset(Dataset):
         Returns the length of the dataset.
 
         Returns:
-        int: The number of items in the dataset.
+            int: The number of items in the dataset.
         """
         return len(self._img_paths)
         
@@ -195,11 +222,11 @@ class ChartersDataset(Dataset):
         """
         Fetch an item from the dataset at the specified index.
 
-        Parameters:
-        index (int): Index of the item to fetch from the dataset.
+        Args:
+            index (int): Index of the item to fetch from the dataset.
 
         Returns:
-        tuple: A tuple containing the image and its associated target (annotations).
+            tuple: A tuple containing the image and its associated target (annotations).
         """
         # Retrieve the key for the image at the specified index
         img_path, label_path = self._img_paths[index], self._label_paths[index]
@@ -417,6 +444,10 @@ if __name__ == '__main__':
             
             epoch_losses.append( loss.detach() )
             loss.backward()
+                
+            # display gradient
+            # plt.imshow( imgs[0].grad.permute(1,2,0) )
+
             optimizer.step()
             optimizer.zero_grad()
 
