@@ -160,7 +160,7 @@ class ChartersDataset(Dataset):
     This class represents a PyTorch Dataset for a collection of images and their annotations.
     The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
     """
-    def __init__(self, img_paths, label_paths, transforms=None):
+    def __init__(self, img_paths, label_paths, img_size, transforms=None):
         """
         Constructor for the Dataset class.
 
@@ -175,7 +175,7 @@ class ChartersDataset(Dataset):
         self._label_paths = label_paths  # List of image annotation files
         self._transforms = v2.Compose([
             v2.ToImage(),
-            v2.Resize([hyper_params['img_size'],hyper_params['img_size']]),
+            v2.Resize([ img_size, img_size]),
             v2.RandomHorizontalFlip(p=.2),
             v2.SanitizeBoundingBoxes(),
             v2.ToDtype(torch.float32, scale=True),
@@ -259,26 +259,21 @@ def build_nn( bb='resnet101'):
             box_head=box_head,)
 
 
-def predict( imgs: Path, weight_file='best.pt' ):
+def predict( imgs: Path, model_file='best.mlmodel' ):
 
-    args, _ = fargv.fargv( p )
-
-    model = build_nn()
-    if weight_file is None:
-        return []
-    if not Path(weight_file).exists():
+    if not Path(model_file).exists():
         return []
 
-    model.load_state_dict( torch.load(weight_file, weights_only=True, map_location=torch.device('cpu')))
-    model.eval().cpu()
+    model = SegModel.load( model_file )
+    img_size = model.hyper_parameters['img_size']
     
     tsf = v2.Compose([
         v2.ToImage(),
-        v2.Resize([ hyper_params['img_size'],hyper_params['args.img_size']]),
+        v2.Resize([ img_size, img_size]),
         v2.ToDtype(torch.float32, scale=True),
     ])
     imgs = [ tsf( Image.open(img).convert('RGB')) for img in imgs ]
-    return (imgs, model( imgs ))
+    return (imgs, model.net( imgs ))
     
 
 class SegModel():
@@ -307,13 +302,28 @@ class SegModel():
             model.net.load_state_dict( state_dict )
 
             if not reset_epochs:
-                model.epochs = epochs
+                model.epochs = epochs if not reset_epochs else []
                 model.hyper_parameters = hyper_parameters
             model.net.train()
             model.net.cuda()
             return model
         return SegModel(**kwargs)
 
+    @staticmethod
+    def load(file_name, **kwargs):
+        if Path(file_name).exists():
+            state_dict = torch.load(file_name, map_location="cpu")
+            del state_dict["epochs"]
+            hyper_parameters = state_dict["hyper_parameters"]
+            del state_dict['hyper_parameters']
+
+            model = SegModel()
+            model.net.load_state_dict( state_dict )
+                                      
+            model.hyper_parameters = hyper_parameters
+            model.net.eval()
+            return model
+        return SegModel(**kwargs)
 
 ### Training 
 if __name__ == '__main__':
@@ -352,9 +362,9 @@ if __name__ == '__main__':
     imgs_train, imgs_test, lbls_train, lbls_test = split_set( imgs, lbls )
     imgs_train, imgs_val, lbls_train, lbls_val = split_set( imgs_train, lbls_train )
 
-    ds_train = ChartersDataset( imgs_train, lbls_train )
-    ds_val = ChartersDataset( imgs_val, lbls_val )
-    ds_test = ChartersDataset( imgs_test, lbls_test )
+    ds_train = ChartersDataset( imgs_train, lbls_train, hyper_params['img_size'] )
+    ds_val = ChartersDataset( imgs_val, lbls_val, hyper_params['img_size'] )
+    ds_test = ChartersDataset( imgs_test, lbls_test, hyper_params['img_size'] )
 
     dl_train = DataLoader( ds_train, batch_size=hyper_params['batch_size'], shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
@@ -366,7 +376,6 @@ if __name__ == '__main__':
         best_loss,  best_epoch = min([ (i, ep['validation_loss']) for i,ep in enumerate(model.epochs) ], key=lambda t: t[1])
     print(best_loss, best_epoch)
 
-    writer=SummaryWriter()
 
     def validate():
         validation_losses = []
@@ -381,7 +390,7 @@ if __name__ == '__main__':
             validation_losses.append( loss.detach())
         return torch.stack( validation_losses).mean().item()    
         
-    def update_tensorboard(epoch, training_loss, validation_loss):
+    def update_tensorboard(writer, epoch, training_loss, validation_loss):
         writer.add_scalar("Loss/train", training_loss, epoch)
         writer.add_scalar("Loss/val", validation_loss, epoch)
         model.net.eval()
@@ -418,6 +427,8 @@ if __name__ == '__main__':
         model.net.cuda()
         model.net.train()
             
+        writer=SummaryWriter()
+
         epoch_start = len( model.epochs )
         if epoch_start > 0:
             print(f"Resuming training at epoch {epoch_start}.")
@@ -427,7 +438,7 @@ if __name__ == '__main__':
             mean_training_loss = train_epoch( epoch )
             mean_validation_loss = validate()
 
-            update_tensorboard(epoch, mean_training_loss, mean_validation_loss)
+            update_tensorboard(writer, epoch, mean_training_loss, mean_validation_loss)
 
             if hyper_params['scheduler']:
                 scheduler.step( mean_validation_loss )
@@ -452,9 +463,11 @@ if __name__ == '__main__':
             if epoch - best_epoch > hyper_params['patience']:
                 print("No improvement since epoch {}: early exit.".format(best_epoch))
                 break
+
+        writer.flush()
+        writer.close()
+
     elif args.mode == 'validate':
         mean_validation_loss = validate(-1)
         print('Validation loss: {:.4f}'.format(mean_validation_loss))
 
-    writer.flush()
-    writer.close()
