@@ -57,6 +57,8 @@ p = {
     'mode': ('train','validate'),
     'weight_file': None,
     'scheduler': 0,
+    'scheduler_patience': 20,
+    'scheduler_factor': 0.5,
     'reset_epochs': False,
     'resume_file': 'last.mlmodel',
     'dry_run': False,
@@ -318,7 +320,13 @@ if __name__ == '__main__':
 
     args, _ = fargv.fargv( p )
 
-    hyper_params={ varname:v for varname,v in vars(args).items() if varname in ('img_size', 'batch_size', 'patience', 'polygon_type', 'train_set_limit', 'lr','scheduler','max_epoch')}
+    hyper_params={ varname:v for varname,v in vars(args).items() if varname in (
+        'img_size', 
+        'batch_size', 
+        'polygon_type', 
+        'train_set_limit', 
+        'lr','scheduler','scheduler_patience','scheduler_factor',
+        'max_epoch','patience',)}
 
     model = SegModel()
 
@@ -331,6 +339,8 @@ if __name__ == '__main__':
         print('Loading model parameters from resume file {}'.format(args.resume_file))
         model = SegModel.resume( args.resume_file ) # reload hyper-parameters from there
         hyper_params.update( model.hyper_parameters )
+    # TODO: partial overriding of param dictionary 
+    # elif args.fine_tune
 
     model.hyper_parameters = hyper_params
             
@@ -350,7 +360,7 @@ if __name__ == '__main__':
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
 
     optimizer = torch.optim.AdamW( model.net.parameters(), lr=hyper_params['lr'])
-    scheduler = ReduceLROnPlateau( optimizer, patience=10 )
+    scheduler = ReduceLROnPlateau( optimizer, patience=hyper_params['scheduler_patience'], factor=hyper_params['scheduler_factor'] )
     best_loss, best_epoch = np.inf, -1
     if model.epochs:
         best_loss,  best_epoch = min([ (i, ep['validation_loss']) for i,ep in enumerate(model.epochs) ], key=lambda t: t[1])
