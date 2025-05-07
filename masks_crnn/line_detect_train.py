@@ -49,6 +49,7 @@ p = {
     'train_set_limit': 0,
     'line_segmentation_suffix': ".lines.gt.json",
     'polygon_type': 'coreBoundary',
+    'backbone': 'resnet101',
     'lr': 2e-4,
     'img_size': 1240,
     'batch_size': 8,
@@ -93,7 +94,69 @@ def display_mask_heatmaps( masks: Tensor ):
     plt.imshow(torch.sum(masks, axis=0).permute(1,2,0).detach().numpy())
     plt.show()
 
-def batch_visuals( imgs:list[Tensor], results: list[dict], threshold=.2, color_count=-1, alpha=.4):
+def display_random_predictions(count=2, model_file='best.mlmodel', random_state=46):
+    random.seed( random_state )
+    imgs = random.sample( list(Path('dataset').glob('*.jpg')), count)
+    img_t, out = predict( imgs, model_file=model_file)
+    viz = batch_visuals( [ {'img':img, 'id':str(path)} for img,path in zip(img_t, imgs)], out, color_count=0 )
+    for img, path in viz:
+        plt.imshow(img)
+        plt.title(path)
+        plt.show()
+
+def display_dir_predictions(directory, model_file='best.mlmodel'):
+    import time
+    for img_path in list(Path(directory).glob('*.jpg')):
+        start = time.time()
+        img_t, out = predict( [img_path], model_file=model_file)
+        print("Prediction: {:.5f}s".format( time.time()-start))
+        start = time.time()
+        viz,path = list(batch_visuals( [ {'img':img_t[0], 'id':str(img_path)} ], out, color_count=0 ))[0]
+        print("Visual: {:.5f}s".format( time.time()-start))
+        plt.imshow( viz )
+        plt.title( path )
+        plt.show()
+
+def grid_wave( img_file ):
+    """
+    Makeshift grid-based transform (to be put into a v2.transform)
+    """
+    from skimage.transform import PiecewiseAffineTransform, warp
+
+    img = skimage.io.imread(img)
+    rows, cols = image.shape[0], image.shape[1]
+
+    src_cols = np.linspace(0, cols, 4)  # simulate folds (increase the number of columns
+                                        # for smoother curves
+    src_rows = np.linspace(0, rows, 10)
+    src_rows, src_cols = np.meshgrid(src_rows, src_cols)
+    src = np.dstack([src_cols.flat, src_rows.flat])[0]
+
+    # add sinusoidal oscillation to row coordinates
+    offset = np.random.randint(30,50)
+    dst_rows = src[:, 1] - np.sin(np.linspace(0, np.random.randint(1,13)/4 * np.pi, src.shape[0])) * offset
+    dst_cols = src[:, 0]
+    dst_rows *= 1.1
+    dst_rows -= 1.1 * offset
+    dst = np.vstack([dst_cols, dst_rows]).T
+
+    tform = PiecewiseAffineTransform()
+    tform.estimate(src, dst)
+
+    out_rows = image.shape[0] - int(1.1 * offset)
+    out_cols = cols
+    out = warp(image, tform, output_shape=(out_rows, out_cols))
+    return out
+
+    #fig, ax = plt.subplots()
+    #ax.imshow(out)
+    #ax.plot(tform.inverse(src)[:, 0], tform.inverse(src)[:, 1], '.b')
+    #ax.axis((0, out_cols, out_rows, 0))
+    #plt.show()
+
+
+
+def batch_visuals( inputs:list[Union[Tensor,dict]], results: list[dict], threshold=.2, color_count=-1, alpha=.4):
     """
     Given a list of image tensors and a list of prediction dictionaries, returns page images
     with mask overlays.
@@ -105,15 +168,21 @@ def batch_visuals( imgs:list[Tensor], results: list[dict], threshold=.2, color_c
     - (optional) line labeling
 
     Args:
-        imgs (list[Tensor]): a list of image tensors.
+        inputs (list[Tensor]): a list of image tensors, or dictionaries with 'img' tensor
         results (list[dict]): a list of predictions, i.e. dictionaries of the form 
             `{'masks': ..., 'boxes': ..., 'scores': ... }`
     Returns:
-        list(np.array): a list of arrays (HWC)
+        list[tuple[np.array,str]]: a list of tuples (HWC, id)
     """
-
-    visuals = []
-    imgs = [ img.cpu().numpy() for img in imgs ]
+    assert isinstance(inputs[0], Tensor) or ( type(inputs[0]) is dict and 'img' in inputs[0] )
+    imgs, ids, visuals = [], [], []
+    if isinstance(inputs[0], Tensor):
+        imgs = [ img.cpu().numpy() for img in inputs ] 
+        ids = [ f"image-{i}" for i in range(len(imgs)) ]
+    elif type(inputs[0]) is dict and 'img' in inputs[0]:
+        imgs=[ img['img'].cpu().numpy() for img in inputs ]
+        ids = [ img['id'] if 'id' in img else f'image-{i}' for (i,img) in enumerate(inputs) ] 
+    
     # filter masks based on box scores 
     masks = [ m.detach().cpu().numpy() for m in [ r['masks'][r['scores']>.6] for r in results] ]
     
@@ -141,9 +210,9 @@ def batch_visuals( imgs:list[Tensor], results: list[dict], threshold=.2, color_c
         composed_img_array = img_complementary + col_msk
         # Combination: (H,W,C), i.e. fit for image viewers and plots
         visuals.append( composed_img_array )
-    batched_visuals = np.stack( visuals )#, (0,3,1,2))
+    #batched_visuals = np.stack( visuals )#, (0,3,1,2))
     
-    return batched_visuals
+    return zip(visuals, ids)
 
 def display_annotated_img( img: Tensor, target: dict, alpha=.4, color='g'):
     """ Overlay of instance masks.
@@ -203,7 +272,8 @@ class ChartersDataset(Dataset):
         self._transforms = v2.Compose([
             v2.ToImage(),
             v2.Resize([ img_size, img_size]),
-            v2.RandomHorizontalFlip(p=.2),
+            v2.RandomRotation( 5 ),
+            v2.RandomHorizontalFlip(p=.4),
             v2.SanitizeBoundingBoxes(),
             v2.ToDtype(torch.float32, scale=True),
             ])
@@ -268,13 +338,15 @@ class ChartersDataset(Dataset):
             bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
             return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
 
-def build_nn( bb='resnet101'):
+def build_nn( backbone='resnet101'):
 
-    if bb=='resnet50':
+    if backbone == 'resnet50':
         return maskrcnn_resnet50_fpn_v2(weights=None, num_classes=2)
         
     backbone = resnet_fpn_backbone(backbone_name='resnet101', weights=None)#weights=ResNet101_Weights.DEFAULT)
     rpn_anchor_generator = _default_anchorgen()
+    #rpn_anchor_generator = AnchorGenerator(sizes=((128,256,512),),
+    #                               aspect_ratios=((1.0, 2.0, 4.0, 8.0),))
     rpn_head = RPNHead(backbone.out_channels, rpn_anchor_generator.num_anchors_per_location()[0], conv_depth=2)
     box_head = FastRCNNConvFCHead(
         (backbone.out_channels, 7, 7), [256, 256, 256, 256], [1024], norm_layer=nn.BatchNorm2d
@@ -305,10 +377,10 @@ def predict( imgs: Path, model_file='best.mlmodel' ):
 
 class SegModel():
 
-    def __init__(self, hyper_params={}):
-        self.net = build_nn()
+    def __init__(self, backbone='resnet101'):
+        self.net = build_nn( backbone )
         self.epochs = []
-        self.hyper_parameters = hyper_params
+        self.hyper_parameters = {}
 
     def save( self, file_name ):
         state_dict = self.net.state_dict()
@@ -325,7 +397,7 @@ class SegModel():
             hyper_parameters = state_dict["hyper_parameters"]
             del state_dict['hyper_parameters']
 
-            model = SegModel()
+            model = SegModel( hyper_parameters['backbone'] )
             model.net.load_state_dict( state_dict )
 
             if not reset_epochs:
@@ -344,7 +416,7 @@ class SegModel():
             hyper_parameters = state_dict["hyper_parameters"]
             del state_dict['hyper_parameters']
 
-            model = SegModel()
+            model = SegModel( hyper_parameters['backbone'] if 'backbone' in hyper_parameters else 'resnet101')
             model.net.load_state_dict( state_dict )
                                       
             model.hyper_parameters = hyper_parameters
@@ -361,11 +433,12 @@ if __name__ == '__main__':
         'img_size', 
         'batch_size', 
         'polygon_type', 
+        'backbone',
         'train_set_limit', 
         'lr','scheduler','scheduler_patience','scheduler_factor',
         'max_epoch','patience',)}
 
-    model = SegModel()
+    model = SegModel( args.backbone )
 
     # loading weights only
     if args.weight_file is not None and Path(args.weight_file).exists():
@@ -394,6 +467,7 @@ if __name__ == '__main__':
     ds_test = ChartersDataset( imgs_test, lbls_test, hyper_params['img_size'] )
 
     dl_train = DataLoader( ds_train, batch_size=hyper_params['batch_size'], shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
+    rpn_anchor_generator = _default_anchorgen()
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
 
     optimizer = torch.optim.AdamW( model.net.parameters(), lr=hyper_params['lr'])
