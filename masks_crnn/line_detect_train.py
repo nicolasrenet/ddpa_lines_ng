@@ -41,6 +41,7 @@ import matplotlib.pyplot as plt
 import random
 
 import sys
+from typing import Union
 import fargv
 
 p = {
@@ -117,42 +118,89 @@ def display_dir_predictions(directory, model_file='best.mlmodel'):
         plt.title( path )
         plt.show()
 
-def grid_wave( img_file ):
+def grid_wave( img_file, grid_cols=4,parallel=False,random_state=46):
     """
     Makeshift grid-based transform (to be put into a v2.transform)
     """
-    from skimage.transform import PiecewiseAffineTransform, warp
 
-    img = skimage.io.imread(img)
-    rows, cols = image.shape[0], image.shape[1]
+    random.seed( random_state ) 
+    img = ski.io.imread(img_file)
+    img = ski.transform.resize(img, (1024,1024))
+    rows, cols = img.shape[0], img.shape[1]
 
-    src_cols = np.linspace(0, cols, 4)  # simulate folds (increase the number of columns
+    src_cols = np.linspace(0, cols, grid_cols)  # simulate folds (increase the number of columns
                                         # for smoother curves
     src_rows = np.linspace(0, rows, 10)
     src_rows, src_cols = np.meshgrid(src_rows, src_cols)
     src = np.dstack([src_cols.flat, src_rows.flat])[0]
 
     # add sinusoidal oscillation to row coordinates
-    offset = np.random.randint(30,50)
-    dst_rows = src[:, 1] - np.sin(np.linspace(0, np.random.randint(1,13)/4 * np.pi, src.shape[0])) * offset
+    offset = float(img.shape[0]/20)
+    column_offset = np.random.choice([10,50], size=src.shape[0]) if not parallel else offset
+    dst_rows = src[:, 1] - np.sin(np.linspace(0, np.random.randint(1,13)/4 * np.pi, src.shape[0])) * column_offset
     dst_cols = src[:, 0]
-    dst_rows *= 1.1
-    dst_rows -= 1.1 * offset
+    
+    ratio = 0.5 # resulting image is {ratio} bigger that its warped manuscript part 
+              # if ratio=1, manuscript is likely to be cropped
+    dst_rows = ratio*( dst_rows - offset)
     dst = np.vstack([dst_cols, dst_rows]).T
 
-    tform = PiecewiseAffineTransform()
+    tform = ski.transform.PiecewiseAffineTransform()
     tform.estimate(src, dst)
 
-    out_rows = image.shape[0] - int(1.1 * offset)
+    out_rows = img.shape[0] - int(1.1 * offset)
     out_cols = cols
-    out = warp(image, tform, output_shape=(out_rows, out_cols))
-    return out
-
-    #fig, ax = plt.subplots()
-    #ax.imshow(out)
+    out = ski.transform.warp(img, tform, output_shape=(out_rows, out_cols))
+    fig, ax = plt.subplots()
+    ax.imshow(out)
     #ax.plot(tform.inverse(src)[:, 0], tform.inverse(src)[:, 1], '.b')
-    #ax.axis((0, out_cols, out_rows, 0))
-    #plt.show()
+    ax.axis((0, out_cols, out_rows, 0))
+    plt.show()
+
+
+def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False,random_state=46):
+    """
+    Makeshift grid-based transform (to be put into a v2.transform)
+    """
+
+    random.seed( random_state ) 
+    rows, cols = img.shape[0], img.shape[1]
+
+    src_cols = np.linspace(0, cols, np.random.choice(grid_cols))  # simulate folds (increase the number of columns
+                                        # for smoother curves
+    src_rows = np.linspace(0, rows, 10)
+    src_rows, src_cols = np.meshgrid(src_rows, src_cols)
+    src = np.dstack([src_cols.flat, src_rows.flat])[0]
+
+    # add sinusoidal oscillation to row coordinates
+    offset = float(img.shape[0]/20)
+    column_offset = np.random.choice([10,50], size=src.shape[0]) if not parallel else offset
+    dst_rows = src[:, 1] - np.sin(np.linspace(0, np.random.randint(1,13)/4 * np.pi, src.shape[0])) * column_offset
+    dst_cols = src[:, 0]
+    
+    ratio = 0.5 # resulting image is {ratio} bigger that its warped manuscript part 
+              # if ratio=1, manuscript is likely to be cropped
+    dst_rows = ratio*( dst_rows - offset)
+    dst = np.vstack([dst_cols, dst_rows]).T
+
+    tform = ski.transform.PiecewiseAffineTransform()
+    tform.estimate(src, dst)
+
+    out_rows = img.shape[0] - int(1.1 * offset)
+    out_cols = cols
+    out = ski.transform.warp(img, tform, output_shape=(out_rows, out_cols))
+
+    result = img.__new__( type(img), img.shape, dtype=img.dtype )
+    result[:]=out
+    return result
+
+
+class ElasticGrid(v2.Transform):
+    def transform(self, inpt: Any, params: Dict['str', Any]):
+        if isinstance(inpt, Tensor):
+            return grid_wave_t( inpt, grid_cols=params['grid_cols'], parallel=params['parallel'] )
+        return
+
 
 
 
@@ -272,6 +320,7 @@ class ChartersDataset(Dataset):
         self._transforms = v2.Compose([
             v2.ToImage(),
             v2.Resize([ img_size, img_size]),
+            RandomElasticGrid(p=.2, cols=(4,8,20)), # this trf. should be size invariant
             v2.RandomRotation( 5 ),
             v2.RandomHorizontalFlip(p=.4),
             v2.SanitizeBoundingBoxes(),
