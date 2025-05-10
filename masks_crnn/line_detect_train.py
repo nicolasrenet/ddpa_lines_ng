@@ -21,6 +21,7 @@ from torch import nn
 
 import torchvision
 import torchvision.transforms.v2 as v2
+import torchvision.tv_tensors as tvt
 from torchvision.tv_tensors import BoundingBoxes, Mask
 from torchvision.models.detection import mask_rcnn
 from torchvision.models.detection import maskrcnn_resnet50_fpn_v2, MaskRCNN
@@ -41,7 +42,7 @@ import matplotlib.pyplot as plt
 import random
 
 import sys
-from typing import Union
+from typing import Union, Any
 import fargv
 
 p = {
@@ -162,7 +163,14 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False
     """
     Makeshift grid-based transform (to be put into a v2.transform)
     """
-
+    print("In:", img.shape, type(img), img.dtype)
+    # if input is a Tensor, assume CHW and reshape to HWC
+    if isinstance(img, Tensor):
+        img_t = img.permute(1,2,0) 
+        if type(img) is tvt.Image:
+            img = tvt.wrap( img_t, like=img)
+        else:
+            img = img_t
     random.seed( random_state ) 
     rows, cols = img.shape[0], img.shape[1]
 
@@ -174,11 +182,11 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False
 
     # add sinusoidal oscillation to row coordinates
     offset = float(img.shape[0]/20)
-    column_offset = np.random.choice([10,50], size=src.shape[0]) if not parallel else offset
+    column_offset = np.random.choice([5,10,50,60], size=src.shape[0]) if not parallel else offset
     dst_rows = src[:, 1] - np.sin(np.linspace(0, np.random.randint(1,13)/4 * np.pi, src.shape[0])) * column_offset
     dst_cols = src[:, 0]
     
-    ratio = 0.5 # resulting image is {ratio} bigger that its warped manuscript part 
+    ratio = 1.0 # resulting image is {ratio} bigger that its warped manuscript part 
               # if ratio=1, manuscript is likely to be cropped
     dst_rows = ratio*( dst_rows - offset)
     dst = np.vstack([dst_cols, dst_rows]).T
@@ -186,20 +194,39 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False
     tform = ski.transform.PiecewiseAffineTransform()
     tform.estimate(src, dst)
 
-    out_rows = img.shape[0] - int(1.1 * offset)
+    out_rows = img.shape[0] #- int(ratio * offset)
     out_cols = cols
     out = ski.transform.warp(img, tform, output_shape=(out_rows, out_cols))
+    #print("Out of warp():", type(img), "->", type(out), out.dtype, out.shape)
+    # keep type, but HWC -> CHW
+    if isinstance(img, Tensor):
+        out = torch.from_numpy(out).permute(2,0,1)
+        if type(img) is tvt.Image:
+            out= tvt.wrap( out, like=img)
+    #print("Return:", type(out), out.dtype, out.shape)
+    return out
 
-    result = img.__new__( type(img), img.shape, dtype=img.dtype )
-    result[:]=out
-    return result
 
 
-class ElasticGrid(v2.Transform):
-    def transform(self, inpt: Any, params: Dict['str', Any]):
-        if isinstance(inpt, Tensor):
-            return grid_wave_t( inpt, grid_cols=params['grid_cols'], parallel=params['parallel'] )
-        return
+class RandomElasticGrid(v2.Transform):
+
+    def __init__(self, **kwargs):
+        self.params = dict(kwargs)
+        self.p = self.params['p']
+        super().__init__()
+
+    def make_params(self, flat_inputs: list[Any]):
+        apply = (torch.rand(size=(1,)) < self.p).item()
+        self.params.update(dict(apply=apply))
+        return self.params
+
+    def transform(self, inpt: Any, params: dict['str', Any]):
+        if not params['apply']:
+            #print('no transform', type(inpt), inpt.dtype)
+            return inpt
+        if isinstance(inpt, BoundingBoxes):
+            return inpt
+        return grid_wave_t( inpt, grid_cols=params['grid_cols'], parallel=params['parallel'] )
 
 
 
@@ -304,7 +331,7 @@ class ChartersDataset(Dataset):
     This class represents a PyTorch Dataset for a collection of images and their annotations.
     The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
     """
-    def __init__(self, img_paths, label_paths, img_size, transforms=None):
+    def __init__(self, img_paths, label_paths, img_size=1024, polygon_type='coreBoundary', transforms=None):
         """
         Constructor for the Dataset class.
 
@@ -313,17 +340,19 @@ class ChartersDataset(Dataset):
             label_paths (list): List of label paths.
             transforms (callable, optional): Optional transform to be applied on a sample.
         """
+
         super(Dataset, self).__init__()
         
         self._img_paths = img_paths  # List of image keys
         self._label_paths = label_paths  # List of image annotation files
+        self.polygon_type = polygon_type
         self._transforms = v2.Compose([
             v2.ToImage(),
             v2.Resize([ img_size, img_size]),
-            RandomElasticGrid(p=.2, cols=(4,8,20)), # this trf. should be size invariant
+            #RandomElasticGrid(p=1.0, grid_cols=(4,20), parallel=False),
             v2.RandomRotation( 5 ),
-            v2.RandomHorizontalFlip(p=.4),
-            v2.SanitizeBoundingBoxes(),
+            v2.RandomHorizontalFlip(p=.2),
+            #v2.SanitizeBoundingBoxes(),
             v2.ToDtype(torch.float32, scale=True),
             ])
 
@@ -358,6 +387,15 @@ class ChartersDataset(Dataset):
         if self._transforms:
             image, target = self._transforms(image, target)
         
+        #plt.imshow( torch.sum(target['masks'], axis=0))
+        #plt.savefig('last_mask.pdf')
+        #plt.show()
+
+        keep = torch.sum( target['masks'], dim=(1,2))>1
+        target['masks']=target['masks'][keep]
+        target['labels']=target['labels'][keep]
+
+        target['boxes']=BoundingBoxes(data=torchvision.ops.masks_to_boxes(target['masks']), format='xyxy', canvas_size=image.shape)
         target['labels'].to(dtype=torch.int64)
 
         return image, target
@@ -380,12 +418,14 @@ class ChartersDataset(Dataset):
             segdict = json.load( annotation_if )
             labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
             #print(type(labels), labels.dtype)
-            polygons = [ [ tuple(p) for p in l[hyper_params['polygon_type']]] for l in segdict['lines'] ]
+            polygons = [ [ tuple(p) for p in l[self.polygon_type]] for l in segdict['lines'] ]
             # Convert polygons to mask images
             masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
+            print("masks before transforms:", type(masks), masks.shape)
             # Generate bounding box annotations from segmentation masks
-            bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
-            return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
+            #bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
+            #return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
+            return img, {'masks': masks, 'labels': labels, 'path': img_path}
 
 def build_nn( backbone='resnet101'):
 
