@@ -228,10 +228,7 @@ class RandomElasticGrid(v2.Transform):
             return inpt
         return grid_wave_t( inpt, grid_cols=params['grid_cols'], parallel=params['parallel'] )
 
-
-
-
-def batch_visuals( inputs:list[Union[Tensor,dict]], results: list[dict], threshold=.2, color_count=-1, alpha=.4):
+def batch_visuals( inputs:list[Union[Tensor,dict]], preds: list[dict], threshold=.2, color_count=-1, alpha=.4):
     """
     Given a list of image tensors and a list of prediction dictionaries, returns page images
     with mask overlays.
@@ -244,7 +241,7 @@ def batch_visuals( inputs:list[Union[Tensor,dict]], results: list[dict], thresho
 
     Args:
         inputs (list[Tensor]): a list of image tensors, or dictionaries with 'img' tensor
-        results (list[dict]): a list of predictions, i.e. dictionaries of the form 
+        preds (list[dict]): a list of predictions, i.e. dictionaries of the form 
             `{'masks': ..., 'boxes': ..., 'scores': ... }`
     Returns:
         list[tuple[np.array,str]]: a list of tuples (HWC, id)
@@ -257,21 +254,18 @@ def batch_visuals( inputs:list[Union[Tensor,dict]], results: list[dict], thresho
     elif type(inputs[0]) is dict and 'img' in inputs[0]:
         imgs=[ img['img'].cpu().numpy() for img in inputs ]
         ids = [ img['id'] if 'id' in img else f'image-{i}' for (i,img) in enumerate(inputs) ] 
+
+    default_color = [0,0,1.0] # BLUE
     
-    # filter masks based on box scores 
-    masks = [ m.detach().cpu().numpy() for m in [ r['masks'][r['scores']>.6] for r in results] ]
-    
-    # thresholding
-    masks = [ m * (m>threshold) for m in masks ] 
-    for img,msk in zip(imgs,masks):
-        # 1. merging [sum()] 2.(C,H,W) -> (H,W,C)
-        bm = np.transpose( np.sum( msk, axis=0).astype('bool'), (1,2,0))
+    for img,p in zip(imgs,preds):
+
+        # generate labeled masks
+        labeled_msk = np.transpose( post_process( p ), (1,2,0))
+        bm = labeled_msk.astype('bool')
         img = np.transpose( img, (1,2,0))
         img_complementary = img * ( ~bm + bm * (1-alpha))
         col_msk = None
         if color_count>=0:
-            # one color per connected component
-            labeled_msk = ski.measure.label( bm, connectivity=1)
             colors = get_n_color_palette( color_count ) if color_count > 0 else get_n_color_palette( np.max(labeled_msk))
             col_msk = np.zeros( img.shape, dtype=img.dtype )
             for l in range(1, np.max(labeled_msk)+1):
@@ -281,13 +275,42 @@ def batch_visuals( inputs:list[Union[Tensor,dict]], results: list[dict], thresho
         # single color
         else:
             # BLUE * BOOL * ALPHA
-            col_msk = np.full(img.shape, [0,0,1.0]) * bm * alpha
+            col_msk = np.full(img.shape, default_color) * bm * alpha
         composed_img_array = img_complementary + col_msk
         # Combination: (H,W,C), i.e. fit for image viewers and plots
         visuals.append( composed_img_array )
-    #batched_visuals = np.stack( visuals )#, (0,3,1,2))
     
-    return zip(visuals, ids)
+    return list(zip(visuals, ids))
+
+def post_process( preds: dict, box_threshold=.6, mask_threshold=.2):
+    """
+    Compute lines from predictions
+
+    Args:
+        preds (dict[str,torch.Tensor]): predicted dictionary for the page:
+            - 'scores'(N) : box probs
+            - 'masks' (NHW): line heatmaps
+    Returns:
+        Ordered labeled masks.
+    """
+    # select masks
+    best_masks = [ m.detach().numpy() for m in preds['masks'][preds['scores']>box_threshold]]
+    # threshold masks
+    masks = [ m * (m > mask_threshold) for m in best_masks ]
+    # merge masks 
+    page_wide_mask = np.sum( masks, axis=0 ).astype('bool')
+    # label components
+    labeled_msk = ski.measure.label( page_wide_mask, connectivity=1 )
+    return labeled_msk
+    # compute polygons?
+    # sort label from top to bottom (using centroids of labeled regions)
+    # note: labels are [1,H,W]. Accordingly centroids are 3-tuples.
+    sorted([ (reg.label, reg.centroid) for reg in ski.measure.regionprops( labeled_msk ) ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
+    print(sorted)
+
+
+
+
 
 def display_annotated_img( img: Tensor, target: dict, alpha=.4, color='g'):
     """ Overlay of instance masks.
@@ -447,7 +470,16 @@ def build_nn( backbone='resnet101'):
             box_head=box_head,)
 
 
-def predict( imgs: Path, model_file='best.mlmodel' ):
+def predict( imgs: list[Path], model_file='best.mlmodel' ):
+    """
+    Args:
+        imgs (list[Path]): lists of image filenames.
+        model_file (str): a saved model
+    Returns:
+        tuple[list[Tensor], list[dict]]: a tuple with the resized images
+            and a list of prediction dictionaries.
+    """
+    assert type(imgs) is list
 
     if not Path(model_file).exists():
         return []
