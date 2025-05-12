@@ -492,12 +492,17 @@ class ChartersDataset(Dataset):
         #plt.savefig('last_mask.pdf')
         #plt.show()
 
-        keep = torch.sum( target['masks'], dim=(1,2))>1
+        # first, filter empty masks
+        keep = torch.sum( target['masks'], dim=(1,2)) > 10
         target['masks']=target['masks'][keep]
         target['labels']=target['labels'][keep]
 
-        target['boxes']=BoundingBoxes(data=torchvision.ops.masks_to_boxes(target['masks']), format='xyxy', canvas_size=image.shape)
-        target['labels'].to(dtype=torch.int64)
+        boxes=BoundingBoxes(data=torchvision.ops.masks_to_boxes(target['masks']), format='xyxy', canvas_size=image.shape)
+        # then, filter invalid boxes, and masks and labels, once more
+        keep=(boxes[:,0]-boxes[:,2])*(boxes[:,1]-boxes[:,3]) != 0 
+        target['boxes']=boxes[keep]
+        target['masks']=target['masks'][keep]
+        target['labels']=target['labels'][keep].to(dtype=torch.int64)
 
         return image, target
 
