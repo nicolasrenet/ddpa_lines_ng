@@ -636,10 +636,9 @@ if __name__ == '__main__':
         'lr','scheduler','scheduler_patience','scheduler_factor',
         'max_epoch','patience',)}
     
-    hyper_params['img_size']=tuple( int(i) for i in hyper_params['img_size']) if (type( args.img_size ) is list) else int(args.img_size)
+    hyper_params['img_size']=tuple( int(i) for i in hyper_params['img_size']) if len(args.img_size)>1 else ( int(args.img_size[0]), int(args.img_size[0]))
 
     model = SegModel( args.backbone )
-
     # loading weights only
     if args.weight_file is not None and Path(args.weight_file).exists():
         print('Loading weights from {}'.format( args.weight_file))
@@ -651,9 +650,7 @@ if __name__ == '__main__':
         hyper_params.update( model.hyper_parameters )
     # TODO: partial overriding of param dictionary 
     # elif args.fine_tune
-
     model.hyper_parameters = hyper_params
-    print(model.hyper_parameters)
             
     random.seed(46)
     imgs = random.sample( args.img_paths, hyper_params['train_set_limit']) if hyper_params['train_set_limit'] else args.img_paths
