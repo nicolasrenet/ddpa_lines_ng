@@ -67,6 +67,8 @@ p = {
     'dry_run': False,
 }
 
+random.seed(46)
+
 def get_n_color_palette(n: int, s=.85, v=.95) -> list:
     """
     Generate n well-distributed random colors. Use golden ratio to generate colors from the HSV color
@@ -98,12 +100,12 @@ def display_mask_heatmaps( masks: Tensor ):
  
 def display_line_masks_raw( predicts: list[dict] ):
     for msks,sc in [ (p['masks'].detach().numpy(),p['scores'].detach().numpy()) for p in preds ]:
-    print(len(msks))
-    for m in msks[sc>.8]:
-        m = m[0]
-        print((m*m>.5).shape)
-        plt.imshow( m*(m>.3) )
-        plt.show()
+        print(len(msks))
+        for m in msks[sc>.8]:
+            m = m[0]
+            print((m*m>.5).shape)
+            plt.imshow( m*(m>.3) )
+            plt.show()
 
 
 def display_random_predictions(count=2, model_file='best.mlmodel', random_state=46):
@@ -133,21 +135,23 @@ def display_dir_predictions(directory, model_file='best.mlmodel'):
             plt.txt(*centroid[:0:-1], label, size=15)
         plt.show()
 
-def display_map( label_map: np.ndarray, attributes, paths ):
-    pass
 
-
-def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False,random_state=46):
+def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),random_state=46):
     """
-    Makeshift grid-based transform (to be put into a v2.transform)
+    Makeshift grid-based transform (to be put into a v2.transform). Randomness potentially affects the output
+    in 3 ways:
+    - range of the sinusoidal function used to move the ys
+    - number of columns in the grid
+    - amount of the y-offset across xs
 
     Args:
         img (Union[Tensor,np.ndarray]): input image, as tensor, or numpy array. For the former,
-        assume CHW for input, with output the same. For the latter, both input and output 
-        are HWC.
+            assume CHW for input, with output the same. For the latter, both input and output 
+            are HWC.
+        grid_cols (tuple[int]): number of cols for this grid is randomly picked from this tuple.
+
     Return:
         Union[Tensor,np.ndarray]: tensor or np.ndarray with same size.
-
     """
     #print("In:", img.shape, type(img), img.dtype)
     # if input is a Tensor, assume CHW and reshape to HWC
@@ -157,10 +161,13 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False
             img = tvt.wrap( img_t, like=img)
         else:
             img = img_t
-    random.seed( random_state ) 
+    np.random.seed( random_state ) 
+    parallel = np.random.choice([True, False])
     rows, cols = img.shape[0], img.shape[1]
 
-    src_cols = np.linspace(0, cols, np.random.choice(grid_cols))  # simulate folds (increase the number of columns
+    col_count = np.random.choice(grid_cols)
+    #print("grid_wave_t( grid_cols={}, random_state={}, parallel={}, col_count={})".format( grid_cols, random_state, parallel, col_count))
+    src_cols = np.linspace(0, cols, col_count)  # simulate folds (increase the number of columns
                                         # for smoother curves
     src_rows = np.linspace(0, rows, 10)
     src_rows, src_cols = np.meshgrid(src_rows, src_cols)
@@ -168,7 +175,7 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False
 
     # add sinusoidal oscillation to row coordinates
     offset = float(img.shape[0]/20)
-    column_offset = np.random.choice([5,10,50,60], size=src.shape[0]) if not parallel else offset
+    column_offset = np.random.choice([5,10,20,30], size=src.shape[0]) if (not parallel and col_count <=5) else offset
     dst_rows = src[:, 1] - np.sin(np.linspace(0, np.random.randint(1,13)/4 * np.pi, src.shape[0])) * column_offset
     dst_cols = src[:, 0]
     
@@ -191,16 +198,32 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False
     return out
 
 
+
 class RandomElasticGrid(v2.Transform):
+    """
+    Deform the image over an elastic grid (v2-compatible)
+
+    TODO: because we're wrapping a single function that is being applied to all DS in a sample,
+    one after another, ensure that any randomized parameter (choice of columns, y-offsets, range of sinusoidal
+    function) is baked in the container, _before_ calling grid_wave_t().
+    """
 
     def __init__(self, **kwargs):
+        """
+        Args:
+            p (float): prob. for applying the transform.
+            grid_cols (tuple[int]): number of columns in the grid from which to pick from (the larger, the smoother the deformation)
+                Ex. with (4,20,), the wrapped function randomly picks 4 or 20 columns
+        """
         self.params = dict(kwargs)
         self.p = self.params['p']
+        # allow to re-seed the wrapped function for each call
         super().__init__()
 
     def make_params(self, flat_inputs: list[Any]):
+        """ Called after initialization """
         apply = (torch.rand(size=(1,)) < self.p).item()
-        self.params.update(dict(apply=apply))
+        self.params.update(dict(apply=apply, random_state=random.randint(1,100))) # passed to transform()
         return self.params
 
     def transform(self, inpt: Any, params: dict['str', Any]):
@@ -209,7 +232,7 @@ class RandomElasticGrid(v2.Transform):
             return inpt
         if isinstance(inpt, BoundingBoxes):
             return inpt
-        return grid_wave_t( inpt, grid_cols=params['grid_cols'], parallel=params['parallel'] )
+        return grid_wave_t( inpt, grid_cols=params['grid_cols'], random_state=params['random_state'])
 
 def batch_visuals( inputs:list[Union[Tensor,dict]], preds: list[dict], threshold=.2, color_count=-1, alpha=.4):
     """
@@ -294,23 +317,75 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.4):
     attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords) for reg in ski.measure.regionprops( labeled_msk ) ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
     if [ att[0] for att in attributes ] != list(range(1, np.max(labeled_msk)+1)):
         print("Labels do not follow reading order")
-    print(len(attributes))
     return (labeled_msk, attributes)
 
 
 def gt_masks_to_labeled_map( masks: Mask ):
-    return np.sum( np.stack([ m * lbl for (lbl,m) in enumerate(m, start=1)]), axis=0)
+    return np.sum( np.stack([ m * lbl for (lbl,m) in enumerate(masks, start=1)]), axis=0)
 
-def simple_metrics(map1, map2):
+def simple_metrics(map_gt, map_pred, iou_threshold=.2, foreground=None):
     """
     Simple metric for flat maps with disjoint labels.
+
+    map_gt (np.ndarray): labeled, flat map (HW)
+    map_pred (np.ndarray): labeled, flat map (HW)
+    iou_threshold (float): (for line-level metrics only) two masks are matched if the Iou > threshold
     """
-    max_lbl = max(np.max( map1), np.max(map2)).item()
+    metrics = {'params': {'iou_threshold': iou_threshold, 'foreground': True if foreground is not None else False},'pixel':{}, 'line':{}}
 
-    intersection = gt_map * (gt_map == pred_map)
+    if foreground is not None:
+        assert foreground.dtype == 'bool' and foreground.shape == map_gt.shape
+        map_gt *= foreground
+        map_pred *= foreground
 
-    for lbl in range( max_lbl):
-        pass
+    max_lbl_gt, max_lbl_pred = [ np.max( m ).item() for m in (map_gt, map_pred) ]
+    max_lbl = max( max_lbl_gt, max_lbl_pred )
+
+    # page-wide, pixel metrics
+    bin_gt, bin_pred = map_gt.astype('bool'), map_pred.astype('bool')
+    pix_tp = np.sum( bin_gt * bin_pred )
+    pix_fn = np.sum( bin_gt * ~bin_pred ) # positive in gt, 0 in pred
+    pix_fp = np.sum( ~bin_gt * bin_pred ) # 0 in gt, positive in pred
+
+    pix_prec = pix_tp / (pix_tp + pix_fp)
+    pix_rec = pix_tp / (pix_tp + pix_fn)
+    pix_f1 = 2 * ( pix_prec * pix_rec ) / (pix_prec + pix_rec )
+    pix_IoU = pix_tp / (pix_tp + pix_fp + pix_fn )
+    metrics['pixel']={'prec': pix_prec, 'rec': pix_rec, 'f1': pix_f1, 'IoU': pix_IoU}
+    metrics['pixel']={ k:round(float(v),4) for k,v in metrics['pixel'].items() }
+
+    #print("Pixel metrics:\n- precision: {}\n- recall: {}\n- f1: {}\n- IoU: {}".format( pix_precision, pix_recall, pix_f1, pix_IoU))
+        
+    # At line-level
+    # - labels may differ even if masks may overlap: accordingly, compare every label to every label
+    # - match labels with max IoU
+    # - discarded GT masks are FN; discarded pred masks are FP
+    line_to_pred_match = {}
+    for lbl_gt in range( 1, max_lbl_gt+1):
+        for lbl_pred in range(1, max_lbl_pred+1):
+            lbl_map_gt, lbl_map_pred = map_gt * (map_gt==lbl_gt), map_pred * (map_pred==lbl_pred)
+            intersection = np.bitwise_and( lbl_map_gt, lbl_map_pred )
+            union = np.bitwise_or( lbl_map_gt, lbl_map_pred ) 
+            #print("Intersection:", np.sum(intersection), "Union:", np.sum(union))
+            IoU = np.sum( intersection ) / np.sum( union )
+            # match between detected mask and gt mask
+            if IoU > iou_threshold:
+                line_to_pred_match[lbl_gt]=lbl_pred
+    # false negative = GT lines that do not have a match at this point
+    line_fn = set( range(1, max_lbl_gt+1)) - set(line_to_pred_match.keys())
+    # false positive = Pred lines that do not have a match
+    line_fp = set( range(1, max_lbl_pred+1)) - set(line_to_pred_match.items())
+    line_tp, line_fn, line_fp = len(line_to_pred_match), len(line_fn), len(line_fp)
+
+    line_prec = line_tp / (line_tp + line_fp)
+    line_rec = line_tp / (line_tp + line_fn)
+    line_f1 = 2 * ( line_prec * line_rec ) / (line_prec + line_rec ) if line_prec or line_rec else np.nan
+    #print("Line metrics:\n- precision: {}\n- recall: {}\n- f1: {}".format( line_precision, line_recall, line_f1))
+
+    metrics['line']={'prec': line_prec, 'rec': line_rec, 'f1': line_f1}
+    metrics['line']={ k:round(float(v),4) for k,v in metrics['line'].items() }
+
+    return metrics
 
 
 
@@ -375,7 +450,7 @@ class ChartersDataset(Dataset):
         self._transforms = v2.Compose([
             v2.ToImage(),
             v2.Resize([ img_size, img_size]),
-            #RandomElasticGrid(p=1.0, grid_cols=(4,20), parallel=False),
+            RandomElasticGrid(p=0.3, grid_cols=(4,20)),
             v2.RandomRotation( 5 ),
             v2.RandomHorizontalFlip(p=.2),
             #v2.SanitizeBoundingBoxes(),
@@ -447,7 +522,7 @@ class ChartersDataset(Dataset):
             polygons = [ [ tuple(p) for p in l[self.polygon_type]] for l in segdict['lines'] ]
             # Convert polygons to mask images
             masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
-            print("masks before transforms:", type(masks), masks.shape)
+            #print("masks before transforms:", type(masks), masks.shape)
             # Generate bounding box annotations from segmentation masks
             #bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
             #return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
@@ -700,3 +775,22 @@ if __name__ == '__main__':
         mean_validation_loss = validate(-1)
         print('Validation loss: {:.4f}'.format(mean_validation_loss))
 
+
+
+def test_metrics():
+
+    # GT map
+#    ds=ld.ChartersDataset( list(Path('./hard_cases').glob('*.jpg')), list(Path('./hard_cases').glob('*.json')), img_size=1024)
+#    map_gt=ld.gt_masks_to_labeled_map(ds[2][1]['masks']) # merging all binary masks into a flat, labeled one 
+#
+#    # Predicted map
+#    imgs = list( Path('hard_cases').glob('*.jpg') )
+#    imgs, preds = ld.predict( imgs, model_file='./best.mlmodel')
+#    map_pred = np.squeeze(ld.post_process( preds[2] )[0])
+
+    map_gt, map_pred, map_foreground = np.load('map_gt.npy'), np.load('map_pred.npy'), np.load('binary_img.npy')
+    print(simple_metrics( map_gt, map_pred, iou_threshold=0.22, foreground=None))
+    print(simple_metrics( map_gt, map_pred, iou_threshold=0.22, foreground=map_foreground))
+
+
+    
