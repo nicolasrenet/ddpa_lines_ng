@@ -95,6 +95,16 @@ def display_mask_heatmaps( masks: Tensor ):
     """
     plt.imshow(torch.sum(masks, axis=0).permute(1,2,0).detach().numpy())
     plt.show()
+ 
+def display_line_masks_raw( predicts: list[dict] ):
+    for msks,sc in [ (p['masks'].detach().numpy(),p['scores'].detach().numpy()) for p in preds ]:
+    print(len(msks))
+    for m in msks[sc>.8]:
+        m = m[0]
+        print((m*m>.5).shape)
+        plt.imshow( m*(m>.3) )
+        plt.show()
+
 
 def display_random_predictions(count=2, model_file='best.mlmodel', random_state=46):
     random.seed( random_state )
