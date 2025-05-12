@@ -53,7 +53,7 @@ p = {
     'polygon_type': 'coreBoundary',
     'backbone': 'resnet101',
     'lr': 2e-4,
-    'img_size': 1240,
+    'img_size': set((1240,)),
     'batch_size': 8,
     'patience': 50,
     'tensorboard_sample_size': 2,
@@ -432,7 +432,7 @@ class ChartersDataset(Dataset):
     This class represents a PyTorch Dataset for a collection of images and their annotations.
     The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
     """
-    def __init__(self, img_paths, label_paths, img_size=1024, polygon_type='coreBoundary', transforms=None):
+    def __init__(self, img_paths, label_paths, img_size=(1024,), polygon_type='coreBoundary', transforms=None):
         """
         Constructor for the Dataset class.
 
@@ -444,12 +444,15 @@ class ChartersDataset(Dataset):
 
         super(Dataset, self).__init__()
         
+        width, height = (img_size[0],img_size[0]) if len(img_size)==1 else img_size
+        print(width, height)
+
         self._img_paths = img_paths  # List of image keys
         self._label_paths = label_paths  # List of image annotation files
         self.polygon_type = polygon_type
         self._transforms = v2.Compose([
             v2.ToImage(),
-            v2.Resize([ img_size, img_size]),
+            v2.Resize([ width, height]),
             RandomElasticGrid(p=0.3, grid_cols=(4,20)),
             v2.RandomRotation( 5 ),
             v2.RandomHorizontalFlip(p=.2),
@@ -569,10 +572,11 @@ def predict( imgs: list[Path], model_file='best.mlmodel' ):
 
     model = SegModel.load( model_file )
     img_size = model.hyper_parameters['img_size']
+    width, height = (img_size[0],img_size[0]) if len(img_size)==1  else img_size
     
     tsf = v2.Compose([
         v2.ToImage(),
-        v2.Resize([ img_size, img_size]),
+        v2.Resize([ width,height]),
         v2.ToDtype(torch.float32, scale=True),
     ])
     imgs = [ tsf( Image.open(img).convert('RGB')) for img in imgs ]
@@ -641,6 +645,7 @@ if __name__ == '__main__':
         'train_set_limit', 
         'lr','scheduler','scheduler_patience','scheduler_factor',
         'max_epoch','patience',)}
+    hyper_params['img_size']=tuple( int(i) for i in hyper_params['img_size'] )
 
     model = SegModel( args.backbone )
 
@@ -657,6 +662,7 @@ if __name__ == '__main__':
     # elif args.fine_tune
 
     model.hyper_parameters = hyper_params
+    print(model.hyper_parameters)
             
     random.seed(46)
     imgs = random.sample( args.img_paths, hyper_params['train_set_limit']) if hyper_params['train_set_limit'] else args.img_paths
