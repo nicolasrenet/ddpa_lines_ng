@@ -100,10 +100,12 @@ def display_random_predictions(count=2, model_file='best.mlmodel', random_state=
     random.seed( random_state )
     imgs = random.sample( list(Path('dataset').glob('*.jpg')), count)
     img_t, out = predict( imgs, model_file=model_file)
-    viz = batch_visuals( [ {'img':img, 'id':str(path)} for img,path in zip(img_t, imgs)], out, color_count=0 )
-    for img, path in viz:
-        plt.imshow(img)
+    vizs = batch_visuals( [ {'img':img, 'id':str(path)} for img,path in zip(img_t, imgs)], out, color_count=0 )
+    for mp, atts, path in viz:
+        plt.imshow(mp)
         plt.title(path)
+        for label, centroid, _, _ in atts:
+            plt.txt(*centroid[:0:-1], label, size=15)
         plt.show()
 
 def display_dir_predictions(directory, model_file='best.mlmodel'):
@@ -113,57 +115,31 @@ def display_dir_predictions(directory, model_file='best.mlmodel'):
         img_t, out = predict( [img_path], model_file=model_file)
         print("Prediction: {:.5f}s".format( time.time()-start))
         start = time.time()
-        viz,path = list(batch_visuals( [ {'img':img_t[0], 'id':str(img_path)} ], out, color_count=0 ))[0]
+        mp, atts, path = batch_visuals( [ {'img':img_t[0], 'id':str(img_path)} ], out, color_count=0 )[0]
         print("Visual: {:.5f}s".format( time.time()-start))
-        plt.imshow( viz )
+        plt.imshow( mp )
         plt.title( path )
+        for label, centroid, _, _ in atts:
+            plt.txt(*centroid[:0:-1], label, size=15)
         plt.show()
 
-def grid_wave( img_file, grid_cols=4,parallel=False,random_state=46):
-    """
-    Makeshift grid-based transform (to be put into a v2.transform)
-    """
-
-    random.seed( random_state ) 
-    img = ski.io.imread(img_file)
-    img = ski.transform.resize(img, (1024,1024))
-    rows, cols = img.shape[0], img.shape[1]
-
-    src_cols = np.linspace(0, cols, grid_cols)  # simulate folds (increase the number of columns
-                                        # for smoother curves
-    src_rows = np.linspace(0, rows, 10)
-    src_rows, src_cols = np.meshgrid(src_rows, src_cols)
-    src = np.dstack([src_cols.flat, src_rows.flat])[0]
-
-    # add sinusoidal oscillation to row coordinates
-    offset = float(img.shape[0]/20)
-    column_offset = np.random.choice([10,50], size=src.shape[0]) if not parallel else offset
-    dst_rows = src[:, 1] - np.sin(np.linspace(0, np.random.randint(1,13)/4 * np.pi, src.shape[0])) * column_offset
-    dst_cols = src[:, 0]
-    
-    ratio = 0.5 # resulting image is {ratio} bigger that its warped manuscript part 
-              # if ratio=1, manuscript is likely to be cropped
-    dst_rows = ratio*( dst_rows - offset)
-    dst = np.vstack([dst_cols, dst_rows]).T
-
-    tform = ski.transform.PiecewiseAffineTransform()
-    tform.estimate(src, dst)
-
-    out_rows = img.shape[0] - int(1.1 * offset)
-    out_cols = cols
-    out = ski.transform.warp(img, tform, output_shape=(out_rows, out_cols))
-    fig, ax = plt.subplots()
-    ax.imshow(out)
-    #ax.plot(tform.inverse(src)[:, 0], tform.inverse(src)[:, 1], '.b')
-    ax.axis((0, out_cols, out_rows, 0))
-    plt.show()
+def display_map( label_map: np.ndarray, attributes, paths ):
+    pass
 
 
 def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False,random_state=46):
     """
     Makeshift grid-based transform (to be put into a v2.transform)
+
+    Args:
+        img (Union[Tensor,np.ndarray]): input image, as tensor, or numpy array. For the former,
+        assume CHW for input, with output the same. For the latter, both input and output 
+        are HWC.
+    Return:
+        Union[Tensor,np.ndarray]: tensor or np.ndarray with same size.
+
     """
-    print("In:", img.shape, type(img), img.dtype)
+    #print("In:", img.shape, type(img), img.dtype)
     # if input is a Tensor, assume CHW and reshape to HWC
     if isinstance(img, Tensor):
         img_t = img.permute(1,2,0) 
@@ -190,10 +166,8 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False
               # if ratio=1, manuscript is likely to be cropped
     dst_rows = ratio*( dst_rows - offset)
     dst = np.vstack([dst_cols, dst_rows]).T
-
     tform = ski.transform.PiecewiseAffineTransform()
     tform.estimate(src, dst)
-
     out_rows = img.shape[0] #- int(ratio * offset)
     out_cols = cols
     out = ski.transform.warp(img, tform, output_shape=(out_rows, out_cols))
@@ -205,7 +179,6 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),parallel=False
             out= tvt.wrap( out, like=img)
     #print("Return:", type(out), out.dtype, out.shape)
     return out
-
 
 
 class RandomElasticGrid(v2.Transform):
@@ -244,10 +217,10 @@ def batch_visuals( inputs:list[Union[Tensor,dict]], preds: list[dict], threshold
         preds (list[dict]): a list of predictions, i.e. dictionaries of the form 
             `{'masks': ..., 'boxes': ..., 'scores': ... }`
     Returns:
-        list[tuple[np.array,str]]: a list of tuples (HWC, id)
+        list[tuple[np.array, dict, str]]: a list of tuples (HWC, attributes, id)
     """
     assert isinstance(inputs[0], Tensor) or ( type(inputs[0]) is dict and 'img' in inputs[0] )
-    imgs, ids, visuals = [], [], []
+    imgs, ids, maps, attr = [], [], [], []
     if isinstance(inputs[0], Tensor):
         imgs = [ img.cpu().numpy() for img in inputs ] 
         ids = [ f"image-{i}" for i in range(len(imgs)) ]
@@ -258,9 +231,9 @@ def batch_visuals( inputs:list[Union[Tensor,dict]], preds: list[dict], threshold
     default_color = [0,0,1.0] # BLUE
     
     for img,p in zip(imgs,preds):
-
         # generate labeled masks
-        labeled_msk = np.transpose( post_process( p ), (1,2,0))
+        labeled_msk, attributes = post_process( p, mask_threshold=.3 )
+        labeled_msk = np.transpose( labeled_msk, (1,2,0))
         bm = labeled_msk.astype('bool')
         img = np.transpose( img, (1,2,0))
         img_complementary = img * ( ~bm + bm * (1-alpha))
@@ -278,36 +251,56 @@ def batch_visuals( inputs:list[Union[Tensor,dict]], preds: list[dict], threshold
             col_msk = np.full(img.shape, default_color) * bm * alpha
         composed_img_array = img_complementary + col_msk
         # Combination: (H,W,C), i.e. fit for image viewers and plots
-        visuals.append( composed_img_array )
+        maps.append(composed_img_array)
+        attr.append(attributes)
     
-    return list(zip(visuals, ids))
+    return list(zip(maps, attr, ids))
 
-def post_process( preds: dict, box_threshold=.6, mask_threshold=.2):
+def post_process( preds: dict, box_threshold=.9, mask_threshold=.4):
     """
-    Compute lines from predictions
+    Compute lines from predictions.
 
     Args:
         preds (dict[str,torch.Tensor]): predicted dictionary for the page:
             - 'scores'(N) : box probs
             - 'masks' (NHW): line heatmaps
     Returns:
-        Ordered labeled masks.
+        tuple[ np.ndarray, list[tuple[int, list, float, list]]]: a pair with
+            - labeled map(1,H,W)
+            - a list of line attribute tuples (label, centroid pt, area, polygon coords.)
     """
     # select masks
     best_masks = [ m.detach().numpy() for m in preds['masks'][preds['scores']>box_threshold]]
     # threshold masks
     masks = [ m * (m > mask_threshold) for m in best_masks ]
+
     # merge masks 
     page_wide_mask = np.sum( masks, axis=0 ).astype('bool')
     # label components
     labeled_msk = ski.measure.label( page_wide_mask, connectivity=1 )
-    return labeled_msk
-    # compute polygons?
+    #return labeled_msk
     # sort label from top to bottom (using centroids of labeled regions)
-    # note: labels are [1,H,W]. Accordingly centroids are 3-tuples.
-    sorted([ (reg.label, reg.centroid) for reg in ski.measure.regionprops( labeled_msk ) ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
-    print(sorted)
+    # note: labels are [1,H,W]. Accordingly, centroids are 3-tuples.
+    attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords) for reg in ski.measure.regionprops( labeled_msk ) ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
+    if [ att[0] for att in attributes ] != list(range(1, np.max(labeled_msk)+1)):
+        print("Labels do not follow reading order")
+    print(len(attributes))
+    return (labeled_msk, attributes)
 
+
+def gt_masks_to_labeled_map( masks: Mask ):
+    return np.sum( np.stack([ m * lbl for (lbl,m) in enumerate(m, start=1)]), axis=0)
+
+def simple_metrics(map1, map2):
+    """
+    Simple metric for flat maps with disjoint labels.
+    """
+    max_lbl = max(np.max( map1), np.max(map2)).item()
+
+    intersection = gt_map * (gt_map == pred_map)
+
+    for lbl in range( max_lbl):
+        pass
 
 
 
