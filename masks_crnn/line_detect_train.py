@@ -427,115 +427,6 @@ def split_set( *arrays, test_size=.2, random_state =46):
     return sets
 
 
-class ChartersDataset(Dataset):
-    """
-    This class represents a PyTorch Dataset for a collection of images and their annotations.
-    The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
-    """
-    def __init__(self, img_paths, label_paths, img_size=(1024,), polygon_type='coreBoundary', transforms=None):
-        """
-        Constructor for the Dataset class.
-
-        Parameters:
-            img_paths (list): List of unique identifiers for images.
-            label_paths (list): List of label paths.
-            transforms (callable, optional): Optional transform to be applied on a sample.
-        """
-
-        super(Dataset, self).__init__()
-        
-        width, height = (img_size[0],img_size[0]) if len(img_size)==1 else img_size
-        print(width, height)
-
-        self._img_paths = img_paths  # List of image keys
-        self._label_paths = label_paths  # List of image annotation files
-        self.polygon_type = polygon_type
-        self._transforms = v2.Compose([
-            v2.ToImage(),
-            v2.Resize([ width, height]),
-            RandomElasticGrid(p=0.3, grid_cols=(4,20)),
-            v2.RandomRotation( 5 ),
-            v2.RandomHorizontalFlip(p=.2),
-            #v2.SanitizeBoundingBoxes(),
-            v2.ToDtype(torch.float32, scale=True),
-            ])
-
-        
-    def __len__(self):
-        """
-        Returns the length of the dataset.
-
-        Returns:
-            int: The number of items in the dataset.
-        """
-        return len(self._img_paths)
-        
-    def __getitem__(self, index):
-        """
-        Fetch an item from the dataset at the specified index.
-
-        Args:
-            index (int): Index of the item to fetch from the dataset.
-
-        Returns:
-            tuple: A tuple containing the image and its associated target (annotations).
-        """
-        # Retrieve the key for the image at the specified index
-        img_path, label_path = self._img_paths[index], self._label_paths[index]
-        # Get the annotations for this image
-        label_path = Path(str(img_path).replace('.img.jpg','.lines.gt.json'))
-        # Load the image and its target (segmentation masks, bounding boxes and labels)
-        image, target = self._load_image_and_target(img_path, label_path)
-        
-        # Apply the transformations, if any
-        if self._transforms:
-            image, target = self._transforms(image, target)
-        
-        #plt.imshow( torch.sum(target['masks'], axis=0))
-        #plt.savefig('last_mask.pdf')
-        #plt.show()
-
-        # first, filter empty masks
-        keep = torch.sum( target['masks'], dim=(1,2)) > 10
-        target['masks']=target['masks'][keep]
-        target['labels']=target['labels'][keep]
-
-        boxes=BoundingBoxes(data=torchvision.ops.masks_to_boxes(target['masks']), format='xyxy', canvas_size=image.shape)
-        # then, filter invalid boxes, and masks and labels, once more
-        keep=(boxes[:,0]-boxes[:,2])*(boxes[:,1]-boxes[:,3]) != 0 
-        target['boxes']=boxes[keep]
-        target['masks']=target['masks'][keep]
-        target['labels']=target['labels'][keep].to(dtype=torch.int64)
-
-        return image, target
-
-    def _load_image_and_target(self, img_path, annotation_path):
-        """
-        Load an image and its target (bounding boxes and labels).
-
-        Parameters:
-            img_path (Path): image path
-            annotation_path (Path): annotation path
-
-        Returns:
-            tuple: A tuple containing the image and a dictionary with 'boxes' and 'labels' keys.
-        """
-        # Open the image file and convert it to RGB
-        img = Image.open(img_path).convert('RGB')
-
-        with open( annotation_path, 'r') as annotation_if:
-            segdict = json.load( annotation_if )
-            labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
-            #print(type(labels), labels.dtype)
-            polygons = [ [ tuple(p) for p in l[self.polygon_type]] for l in segdict['lines'] ]
-            # Convert polygons to mask images
-            masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
-            #print("masks before transforms:", type(masks), masks.shape)
-            # Generate bounding box annotations from segmentation masks
-            #bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
-            #return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
-            return img, {'masks': masks, 'labels': labels, 'path': img_path}
-
 def build_nn( backbone='resnet101'):
 
     if backbone == 'resnet50':
@@ -632,6 +523,105 @@ class SegModel():
             return model
         return SegModel(**kwargs)
 
+class ChartersDataset(Dataset):
+    """
+    This class represents a PyTorch Dataset for a collection of images and their annotations.
+    The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
+    """
+    def __init__(self, img_paths, label_paths, polygon_type='coreBoundary', transforms=None):
+        """
+        Constructor for the Dataset class.
+
+        Parameters:
+            img_paths (list): List of unique identifiers for images.
+            label_paths (list): List of label paths.
+            transforms (callable, optional): Optional transform to be applied on a sample.
+        """
+        super(Dataset, self).__init__()
+        
+        self._img_paths = img_paths  # List of image keys
+        self._label_paths = label_paths  # List of image annotation files
+        self.polygon_type = polygon_type
+        self._transforms = transforms if transforms is not None else v2.Compose([
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),])
+
+        
+    def __len__(self):
+        """
+        Returns the length of the dataset.
+
+        Returns:
+            int: The number of items in the dataset.
+        """
+        return len(self._img_paths)
+        
+    def __getitem__(self, index):
+        """
+        Fetch an item from the dataset at the specified index.
+
+        Args:
+            index (int): Index of the item to fetch from the dataset.
+
+        Returns:
+            tuple: A tuple containing the image and its associated target (annotations).
+        """
+        # Retrieve the key for the image at the specified index
+        img_path, label_path = self._img_paths[index], self._label_paths[index]
+        # Get the annotations for this image
+        label_path = Path(str(img_path).replace('.img.jpg','.lines.gt.json'))
+        # Load the image and its target (segmentation masks, bounding boxes and labels)
+        image, target = self._load_image_and_target(img_path, label_path)
+        
+        # Apply the transformations, if any
+        if self._transforms:
+            image, target = self._transforms(image, target)
+        
+        #plt.imshow( torch.sum(target['masks'], axis=0))
+        #plt.savefig('last_mask.pdf')
+        #plt.show()
+
+        # first, filter empty masks
+        keep = torch.sum( target['masks'], dim=(1,2)) > 10
+        target['masks']=target['masks'][keep]
+        target['labels']=target['labels'][keep]
+
+        boxes=BoundingBoxes(data=torchvision.ops.masks_to_boxes(target['masks']), format='xyxy', canvas_size=image.shape)
+        # then, filter invalid boxes, and masks and labels, once more
+        keep=(boxes[:,0]-boxes[:,2])*(boxes[:,1]-boxes[:,3]) != 0 
+        target['boxes']=boxes[keep]
+        target['masks']=target['masks'][keep]
+        target['labels']=target['labels'][keep].to(dtype=torch.int64)
+
+        return image, target
+
+    def _load_image_and_target(self, img_path, annotation_path):
+        """
+        Load an image and its target (bounding boxes and labels).
+
+        Parameters:
+            img_path (Path): image path
+            annotation_path (Path): annotation path
+
+        Returns:
+            tuple: A tuple containing the image and a dictionary with 'boxes' and 'labels' keys.
+        """
+        # Open the image file and convert it to RGB
+        img = Image.open(img_path).convert('RGB')
+
+        with open( annotation_path, 'r') as annotation_if:
+            segdict = json.load( annotation_if )
+            labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
+            #print(type(labels), labels.dtype)
+            polygons = [ [ tuple(p) for p in l[self.polygon_type]] for l in segdict['lines'] ]
+            # Convert polygons to mask images
+            masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
+            #print("masks before transforms:", type(masks), masks.shape)
+            # Generate bounding box annotations from segmentation masks
+            #bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
+            #return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
+            return img, {'masks': masks, 'labels': labels, 'path': img_path}
+
 ### Training 
 if __name__ == '__main__':
 
@@ -645,7 +635,8 @@ if __name__ == '__main__':
         'train_set_limit', 
         'lr','scheduler','scheduler_patience','scheduler_factor',
         'max_epoch','patience',)}
-    hyper_params['img_size']=tuple( int(i) for i in hyper_params['img_size'] )
+    
+    hyper_params['img_size']=tuple( int(i) for i in hyper_params['img_size']) if (type( args.img_size ) is list) else int(args.img_size)
 
     model = SegModel( args.backbone )
 
@@ -672,9 +663,23 @@ if __name__ == '__main__':
     imgs_train, imgs_test, lbls_train, lbls_test = split_set( imgs, lbls )
     imgs_train, imgs_val, lbls_train, lbls_val = split_set( imgs_train, lbls_train )
 
-    ds_train = ChartersDataset( imgs_train, lbls_train, hyper_params['img_size'] )
-    ds_val = ChartersDataset( imgs_val, lbls_val, hyper_params['img_size'] )
-    ds_test = ChartersDataset( imgs_test, lbls_test, hyper_params['img_size'] )
+    train_transforms = v2.Compose([
+            v2.ToImage(),
+            v2.Resize( hyper_params['img_size'] ),
+            RandomElasticGrid(p=0.3, grid_cols=(4,20)),
+            v2.RandomRotation( 5 ),
+            v2.RandomHorizontalFlip(p=.2),
+            #v2.SanitizeBoundingBoxes(),
+            v2.ToDtype(torch.float32, scale=True),
+            ])
+    validate_transforms = v2.Compose([
+            v2.ToImage(),
+            v2.Resize( hyper_params['img_size'] ),
+            v2.ToDtype(torch.float32, scale=True), ])
+
+    ds_train = ChartersDataset( imgs_train, lbls_train, transforms=train_transforms)
+    ds_val = ChartersDataset( imgs_val, lbls_val, transforms=validate_transforms)
+    ds_test = ChartersDataset( imgs_test, lbls_test, transforms=validate_transforms)
 
     dl_train = DataLoader( ds_train, batch_size=hyper_params['batch_size'], shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
     rpn_anchor_generator = _default_anchorgen()
