@@ -198,72 +198,6 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.4):
 
 
 
-def simple_metrics(map_gt, map_pred, iou_threshold=.2, foreground=None):
-    """
-    Simple metric for flat maps with disjoint labels.
-
-    map_gt (np.ndarray): labeled, flat map (HW)
-    map_pred (np.ndarray): labeled, flat map (HW)
-    iou_threshold (float): (for line-level metrics only) two masks are matched if the Iou > threshold
-    """
-    metrics = {'params': {'iou_threshold': iou_threshold, 'foreground': True if foreground is not None else False},'pixel':{}, 'line':{}}
-
-    if foreground is not None:
-        assert foreground.dtype == 'bool' and foreground.shape == map_gt.shape
-        map_gt *= foreground
-        map_pred *= foreground
-
-    max_lbl_gt, max_lbl_pred = [ np.max( m ).item() for m in (map_gt, map_pred) ]
-    max_lbl = max( max_lbl_gt, max_lbl_pred )
-
-    # page-wide, pixel metrics
-    bin_gt, bin_pred = map_gt.astype('bool'), map_pred.astype('bool')
-    pix_tp = np.sum( bin_gt * bin_pred )
-    pix_fn = np.sum( bin_gt * ~bin_pred ) # positive in gt, 0 in pred
-    pix_fp = np.sum( ~bin_gt * bin_pred ) # 0 in gt, positive in pred
-
-    pix_prec = pix_tp / (pix_tp + pix_fp)
-    pix_rec = pix_tp / (pix_tp + pix_fn)
-    pix_f1 = 2 * ( pix_prec * pix_rec ) / (pix_prec + pix_rec )
-    pix_IoU = pix_tp / (pix_tp + pix_fp + pix_fn )
-    metrics['pixel']={'prec': pix_prec, 'rec': pix_rec, 'f1': pix_f1, 'IoU': pix_IoU}
-    metrics['pixel']={ k:round(float(v),4) for k,v in metrics['pixel'].items() }
-
-    #print("Pixel metrics:\n- precision: {}\n- recall: {}\n- f1: {}\n- IoU: {}".format( pix_precision, pix_recall, pix_f1, pix_IoU))
-        
-    # At line-level
-    # - labels may differ even if masks may overlap: accordingly, compare every label to every label
-    # - match labels with max IoU
-    # - discarded GT masks are FN; discarded pred masks are FP
-    line_to_pred_match = {} # match gt line to predicted line
-    best_match_iou = { lbl:0.0 for lbl in range(1, max_lbl_gt+1) } # store best iou for each gt line
-    for lbl_gt in range( 1, max_lbl_gt+1):
-        for lbl_pred in range(1, max_lbl_pred+1):
-            lbl_map_gt, lbl_map_pred = map_gt * (map_gt==lbl_gt), map_pred * (map_pred==lbl_pred)
-            intersection = np.bitwise_and( lbl_map_gt, lbl_map_pred )
-            union = np.bitwise_or( lbl_map_gt, lbl_map_pred ) 
-            #print("Intersection:", np.sum(intersection), "Union:", np.sum(union))
-            IoU = np.sum( intersection ) / np.sum( union )
-            # match between detected mask and gt mask
-            if IoU > iou_threshold and IoU >= best_match_iou[lbl_gt]:
-                line_to_pred_match[lbl_gt]=lbl_pred
-    # false negative = GT lines that do not have a match at this point
-    line_fn = set( range(1, max_lbl_gt+1)) - set(line_to_pred_match.keys())
-    # false positive = Pred lines that do not have a match
-    line_fp = set( range(1, max_lbl_pred+1)) - set(line_to_pred_match.items())
-    line_tp, line_fn, line_fp = len(line_to_pred_match), len(line_fn), len(line_fp)
-
-    line_prec = line_tp / (line_tp + line_fp)
-    line_rec = line_tp / (line_tp + line_fn)
-    line_f1 = 2 * ( line_prec * line_rec ) / (line_prec + line_rec ) if line_prec or line_rec else np.nan
-    #print("Line metrics:\n- precision: {}\n- recall: {}\n- f1: {}".format( line_precision, line_recall, line_f1))
-
-    metrics['line']={'prec': line_prec, 'rec': line_rec, 'f1': line_f1}
-    metrics['line']={ k:round(float(v),4) for k,v in metrics['line'].items() }
-
-    return metrics
-
-
 def split_set( *arrays, test_size=.2, random_state =46):
     random.seed( random_state)
     seq = range(len(arrays[0]))
@@ -376,7 +310,7 @@ class ChartersDataset(Dataset):
     This class represents a PyTorch Dataset for a collection of images and their annotations.
     The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
     """
-    def __init__(self, img_paths, label_paths, polygon_type='coreBoundary', transforms=None):
+    def __init__(self, img_paths, label_paths, polygon_type='coreBoundary', transforms=None, default_img_size=1024):
         """
         Constructor for the Dataset class.
 
@@ -392,6 +326,7 @@ class ChartersDataset(Dataset):
         self.polygon_type = polygon_type
         self._transforms = transforms if transforms is not None else v2.Compose([
             v2.ToImage(),
+            v2.Resize([ default_img_size, default_img_size ]),
             v2.ToDtype(torch.float32, scale=True),])
 
         
