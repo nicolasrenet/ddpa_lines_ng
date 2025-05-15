@@ -930,10 +930,8 @@ def polygon_pixel_metrics_to_line_based_scores( metrics_hwc: np.ndarray, thresho
     + traverse the IoU-descending sorted list and select the first available match
       for each polygon belonging to the prediction set (thus ensuring that no
       polygon can be matched twice)
-    + a pred/GT match is TP if IoU > threshold
-    + a predicted label with non-null, but less than optimal IoU is a FP
-    + a predicted label with 0-IoU is not to be counted
-    + a false negative is a GT label that has no match
+    + a pred/GT match is TP if IoU > threshold; any unmatched predicted label is FP
+    + any unmatched GT label is a FN
 
     Args:
         metrics (np.ndarray): metrics matrix, with indices [0..m-1, 0..n-1] for labels 1..m, 
@@ -948,7 +946,7 @@ def polygon_pixel_metrics_to_line_based_scores( metrics_hwc: np.ndarray, thresho
 
     # keep only IoU, with preds in rows, gt in cols
     pred_gt_ious = metrics_hwc[:,:,0]/metrics_hwc[:,:,1]
-    #print(pred_gt_ious)
+    print(pred_gt_ious)
 
     pred_to_gt = {}
     best_match_iou = {}
@@ -959,18 +957,15 @@ def polygon_pixel_metrics_to_line_based_scores( metrics_hwc: np.ndarray, thresho
     for lpred in range(label_count_pred):
         for lgt in range(label_count_gt):
             iou = pred_gt_ious[lpred,lgt]
-            if iou < threshold:
-                fp += 1
-            elif lpred in pred_to_gt:
-                if iou > best_match_iou[lpred]
-                    best_math_iou = iou
-                    pred_to_gt[l
+            if iou > threshold:
+                pred_to_gt[ lpred ] = lgt
     print(pred_to_gt)
-    # false positives: 
-    line_fp = len( v for v in pred_gt_ious.values() if v < threshold )
-    #print(line_fp)
-    out = (len(pred_to_gt.items()), len(line_fp), len(line_fn))
-    print(out)
+    # false positives: all those predictions that do not have a match with GT
+    fp = len(set(range(label_count_pred)) - set(pred_to_gt.keys()))
+    fn = len(set(range(label_count_gt)) - set(pred_to_gt.values()))
+    tp = len(pred_to_gt.items())
+    out = (tp, fp, fn)
+    print(out, f"R={tp/(tp+fn)}", f"P={tp/(tp+fp)}")
     return out
 
 
@@ -992,24 +987,24 @@ def mAP( pixel_metrics_list: list[np.ndarray] ):
             - mAP across all IoU thresholds
             - sorted sequence of (precision,recall) values
     """
-    av_metrics = np.zeros((10,len(pixel_metrics_list),3)); # dims: samples,metrics,thresholds
+    av_metrics = np.zeros((len(pixel_metrics_list),10,3)); # dims: samples,thresholds, metrics
     for i, pm in enumerate(pixel_metrics_list):
         for t,thrld in enumerate(np.linspace(.5,.95,10)): 
-            av_metrics[t,i] = polygon_pixel_metrics_to_line_based_scores( pm, threshold=thrld )
-            if t == 3 or t ==8:
-                print("Map {}, threshold {}: {} -".format(i, thrld, av_metrics[t,i]))
-    print("Metrics shape:", av_metrics.shape)
-    # sum over all samples
-    tp_fp_fn = np.sum( av_metrics, axis=1 ) 
+            av_metrics[i,t] = polygon_pixel_metrics_to_line_based_scores( pm, threshold=thrld )
+#            if t == 3 or t==8:
+#                print("Map {}, threshold {}: {} -".format(i, thrld, av_metrics[i,t]))
+#    print("Metrics shape:", av_metrics.shape)
+#    # sum over all samples
+    tp_fp_fn = np.sum( av_metrics, axis=0 ) 
     print('TP|FP|FN')
     print(tp_fp_fn)
     # TP/(TP+FP), TP/(TP+FN) for all thresholds 
-    precision = tp_fp_fn[:,0] / (tp_fp_fn[:,0]+tp_fp_fn[:,1]) 
     recall = tp_fp_fn[:,0] / (tp_fp_fn[:,0]+tp_fp_fn[:,2]) 
+    precision = tp_fp_fn[:,0] / (tp_fp_fn[:,0]+tp_fp_fn[:,1]) 
     print("R:", recall)
     print("P:", precision)
-
-    return (np.sum(precision)/10, list(zip( recall.tolist(), precision.tolist())))
+#
+#    return (np.sum(precision)/10, list(zip( recall.tolist(), precision.tolist())))
     
 
 

@@ -469,7 +469,7 @@ if __name__ == '__main__':
     scheduler = ReduceLROnPlateau( optimizer, patience=hyper_params['scheduler_patience'], factor=hyper_params['scheduler_factor'] )
     best_loss, best_epoch = np.inf, -1
     if model.epochs:
-        best_loss,  best_epoch = min([ (i, ep['validation_loss']) for i,ep in enumerate(model.epochs) ], key=lambda t: t[1])
+        best_epoch,  best_loss = min([ (i, ep['validation_loss']) for i,ep in enumerate(model.epochs) ], key=lambda t: t[1])
     print(best_loss, best_epoch)
 
 
@@ -544,12 +544,14 @@ if __name__ == '__main__':
                 scheduler.step( mean_validation_loss )
             model.epochs.append( {
                 'training_loss': mean_training_loss, 
-                'validation_loss': mean_validation_loss 
+                'validation_loss': mean_validation_loss,
+                'lr': scheduler.get_last_lr()[0]
             } )
             torch.save(model.net.state_dict() , 'last.pt')
             model.save('last.mlmodel')
 
             if mean_validation_loss < best_loss:
+                print("Mean validation loss ({}) < best loss ({}): updating best model.".format(mean_validation_loss, best_loss))
                 best_loss = mean_validation_loss
                 best_epoch = epoch
                 torch.save( model.net.state_dict(), 'best.pt')
