@@ -134,10 +134,6 @@ def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),random_state=4
 class RandomElasticGrid(v2.Transform):
     """
     Deform the image over an elastic grid (v2-compatible)
-
-    TODO: because we're wrapping a single function that is being applied to all DS in a sample,
-    one after another, ensure that any randomized parameter (choice of columns, y-offsets, range of sinusoidal
-    function) is baked in the container, _before_ calling grid_wave_t().
     """
 
     def __init__(self, **kwargs):
@@ -155,6 +151,8 @@ class RandomElasticGrid(v2.Transform):
     def make_params(self, flat_inputs: list[Any]):
         """ Called after initialization """
         apply = (torch.rand(size=(1,)) < self.p).item()
+        # s.t. each of the subsequent calls to the wrapped function (on the flattened list of data structures
+        # in the sample) uses the _same_ random seeed (but a different one for each batch).
         self.params.update(dict(apply=apply, random_state=random.randint(1,100))) # passed to transform()
         return self.params
 
@@ -229,30 +227,35 @@ def build_nn( backbone='resnet101'):
             box_head=box_head,)
 
 
-def predict( imgs: list[Path], model_file='best.mlmodel' ):
+def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.mlmodel' ):
     """
     Args:
-        imgs (list[Path]): lists of image filenames.
+        imgs (list[Union[Path,Tensor]]): lists of image filenames or tensors.
         model_file (str): a saved model
     Returns:
-        tuple[list[Tensor], list[dict]]: a tuple with the resized images
-            and a list of prediction dictionaries.
+        tuple[list[Tensor], list[dict]]: a tuple with 
+        - the resized images (as tensors)
+        - a list of prediction dictionaries.
     """
     assert type(imgs) is list
 
-    if not Path(model_file).exists():
-        return []
+    model = live_model
+    if model is None:
+        if not Path(model_file).exists():
+            return []
+        model = SegModel.load( model_file )
+    model.net.eval()
 
-    model = SegModel.load( model_file )
-    img_size = model.hyper_parameters['img_size']
-    width, height = (img_size[0],img_size[0]) if len(img_size)==1  else img_size
+    if isinstance(imgs[0], Path) or type(imgs[0]) is str:
+        img_size = model.hyper_parameters['img_size']
+        width, height = (img_size[0],img_size[0]) if len(img_size)==1  else img_size
     
-    tsf = v2.Compose([
-        v2.ToImage(),
-        v2.Resize([ width,height]),
-        v2.ToDtype(torch.float32, scale=True),
-    ])
-    imgs = [ tsf( Image.open(img).convert('RGB')) for img in imgs ]
+        tsf = v2.Compose([
+            v2.ToImage(),
+            v2.Resize([ width,height]),
+            v2.ToDtype(torch.float32, scale=True),
+        ])
+        imgs = [ tsf( Image.open(img).convert('RGB')) for img in imgs ]
     return (imgs, model.net( imgs ))
     
 
@@ -465,13 +468,15 @@ if __name__ == '__main__':
     rpn_anchor_generator = _default_anchorgen()
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
 
-    optimizer = torch.optim.AdamW( model.net.parameters(), lr=hyper_params['lr'])
-    scheduler = ReduceLROnPlateau( optimizer, patience=hyper_params['scheduler_patience'], factor=hyper_params['scheduler_factor'] )
-    best_loss, best_epoch = np.inf, -1
+    # update learning parameters from past epochs
+    best_loss, best_epoch, lr = np.inf, -1, hyper_params['lr']
     if model.epochs:
         best_epoch,  best_loss = min([ (i, ep['validation_loss']) for i,ep in enumerate(model.epochs) ], key=lambda t: t[1])
+        lr = model.epochs[-1]['lr']
     print(best_loss, best_epoch)
 
+    optimizer = torch.optim.AdamW( model.net.parameters(), lr=lr )
+    scheduler = ReduceLROnPlateau( optimizer, patience=hyper_params['scheduler_patience'], factor=hyper_params['scheduler_factor'] )
 
     def validate():
         validation_losses = []
@@ -569,9 +574,19 @@ if __name__ == '__main__':
         writer.flush()
         writer.close()
 
+    # validation + metrics
     elif args.mode == 'validate':
-        mean_validation_loss = validate(-1)
+        mean_validation_loss = validate()
         print('Validation loss: {:.4f}'.format(mean_validation_loss))
+
+        pms = []
+        for img,target in ds_val:
+            gt_map = segviz.gt_masks_to_labeled_map( target['masks'] )
+            imgs, preds = predict( [img], live_model=model ) 
+            pred_map = np.squeeze(ld.post_process( preds[0], mask_threshold=.2, box_threshold=.5 )[0]) 
+            pms.append( seglib.polygon_pixel_metrics_two_flat_maps( pred_map, gt_map ))
+        print(seglib.mAP( pms ))
+
 
 
 

@@ -946,7 +946,7 @@ def polygon_pixel_metrics_to_line_based_scores( metrics_hwc: np.ndarray, thresho
 
     # keep only IoU, with preds in rows, gt in cols
     pred_gt_ious = metrics_hwc[:,:,0]/metrics_hwc[:,:,1]
-    print(pred_gt_ious)
+    #print(pred_gt_ious)
 
     pred_to_gt = {}
     best_match_iou = {}
@@ -959,13 +959,13 @@ def polygon_pixel_metrics_to_line_based_scores( metrics_hwc: np.ndarray, thresho
             iou = pred_gt_ious[lpred,lgt]
             if iou > threshold:
                 pred_to_gt[ lpred ] = lgt
-    print(pred_to_gt)
+    #print(pred_to_gt)
     # false positives: all those predictions that do not have a match with GT
     fp = len(set(range(label_count_pred)) - set(pred_to_gt.keys()))
     fn = len(set(range(label_count_gt)) - set(pred_to_gt.values()))
     tp = len(pred_to_gt.items())
     out = (tp, fp, fn)
-    print(out, f"R={tp/(tp+fn)}", f"P={tp/(tp+fp)}")
+    #print(out, f"R={tp/(tp+fn)}", f"P={tp/(tp+fp)}")
     return out
 
 
@@ -1003,8 +1003,13 @@ def mAP( pixel_metrics_list: list[np.ndarray] ):
     precision = tp_fp_fn[:,0] / (tp_fp_fn[:,0]+tp_fp_fn[:,1]) 
     print("R:", recall)
     print("P:", precision)
-#
-#    return (np.sum(precision)/10, list(zip( recall.tolist(), precision.tolist())))
+
+
+    return {
+            'mAP50': precision[0], 
+            'mAP75': precision[5], 
+            'mAP50_95': np.sum(precision)/10, 
+            'recall/precision': list(zip( recall.tolist(), precision.tolist()))}
     
 
 
