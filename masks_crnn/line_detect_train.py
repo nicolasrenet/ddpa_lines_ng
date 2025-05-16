@@ -43,24 +43,30 @@ import sys
 from typing import Union, Any
 import fargv
 
+sys.path.append('.')
+
+from libs import segviz, seglib
+
 p = {
     'max_epoch': 250,
-    'max_epoch_force': -1,
+    'max_epoch_force': [-1, "If non-negative, this overrides a 'max_epoch' value read from a resumed model"],
     'img_paths': list(Path("dataset").glob('*.img.jpg')),
-    'train_set_limit': 0,
+    'train_set_limit': [0, "If positive, train on a random sampling of the train set."],
+    'validation_set_limit': [0, "If positive, validate on a random sampling of the train set (only for 'validate' mode of the script, not for epoch-validation during training)."],
     'line_segmentation_suffix': ".lines.gt.json",
     'polygon_type': 'coreBoundary',
-    'backbone': 'resnet101',
+    'backbone': ('resnet101','resnet50'),
     'lr': 2e-4,
-    'img_size': set((1240,)),
-    'batch_size': 8,
+    'img_size': [1024, "Resize the input images to <img_size> * <img_size>; if 'img_height non-null, this determines the width."],
+    'img_height': [0, "If non-null, input images are resize to <img_size> * <img_height>"],
+    'batch_size': 4,
     'patience': 50,
     'tensorboard_sample_size': 2,
     'mode': ('train','validate'),
     'weight_file': None,
     'scheduler': 0,
-    'scheduler_patience': 20,
-    'scheduler_factor': 0.5,
+    'scheduler_patience': 15,
+    'scheduler_factor': 0.9,
     'reset_epochs': False,
     'resume_file': 'last.mlmodel',
     'dry_run': False,
@@ -245,6 +251,7 @@ def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.m
         if not Path(model_file).exists():
             return []
         model = SegModel.load( model_file )
+    model.net.cpu()
     model.net.eval()
 
     if isinstance(imgs[0], Path) or type(imgs[0]) is str:
@@ -257,6 +264,7 @@ def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.m
             v2.ToDtype(torch.float32, scale=True),
         ])
         imgs = [ tsf( Image.open(img).convert('RGB')) for img in imgs ]
+        
     return (imgs, model.net( imgs ))
     
 
@@ -415,7 +423,6 @@ if __name__ == '__main__':
     args, _ = fargv.fargv( p )
 
     hyper_params={ varname:v for varname,v in vars(args).items() if varname in (
-        'img_size', 
         'batch_size', 
         'polygon_type', 
         'backbone',
@@ -423,7 +430,7 @@ if __name__ == '__main__':
         'lr','scheduler','scheduler_patience','scheduler_factor',
         'max_epoch','patience',)}
     
-    hyper_params['img_size']=tuple( int(i) for i in hyper_params['img_size']) if len(args.img_size)>1 else ( int(args.img_size[0]), int(args.img_size[0]))
+    hyper_params['img_size']=[ int(args.img_size), int(args.img_size) ] if not args.img_height else [ int(args.img_size), int(args.img_height) ]
 
     model = SegModel( args.backbone )
     # loading weights only
@@ -582,14 +589,22 @@ if __name__ == '__main__':
 
     # validation + metrics
     elif args.mode == 'validate':
-        mean_validation_loss = validate()
-        print('Validation loss: {:.4f}'.format(mean_validation_loss))
+        # 1st pass: mask-rcnn validation, for loss
+        # TODO: detailed loss
+        #mean_validation_loss = validate()
+        #print('Validation loss: {:.4f}'.format(mean_validation_loss))
 
+        # 2nd pass: metrics on post-processed lines
+        # use the same model
         pms = []
-        for img,target in ds_val:
+        for i,sample in enumerate(list(ds_val)[:args.validation_set_limit] if args.validation_set_limit else ds_val):
+            img, target = sample
+            print(f'{i}: computing gt_map...', end='')
             gt_map = segviz.gt_masks_to_labeled_map( target['masks'] )
+            print(f'computing pred_map...', end='')
             imgs, preds = predict( [img], live_model=model ) 
-            pred_map = np.squeeze(ld.post_process( preds[0], mask_threshold=.2, box_threshold=.5 )[0]) 
+            pred_map = np.squeeze(post_process( preds[0], mask_threshold=.2, box_threshold=.5 )[0]) 
+            print(f'computing pixel_metrics')
             pms.append( seglib.polygon_pixel_metrics_two_flat_maps( pred_map, gt_map ))
         print(seglib.mAP( pms ))
 

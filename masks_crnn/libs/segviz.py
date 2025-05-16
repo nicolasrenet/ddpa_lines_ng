@@ -160,9 +160,21 @@ def display_annotated_img( img: Tensor, target: dict, alpha=.4, color='g'):
     plt.show()
 
 
-def gt_masks_to_labeled_map( masks: Mask ):
+def gt_masks_to_labeled_map( masks: Mask ) -> np.ndarray:
     """
     Combine stacks of GT line masks (as in data annotations) into a single, labeled page-wide map.
     """
     return np.sum( np.stack([ m * lbl for (lbl,m) in enumerate(masks, start=1)]), axis=0)
 
+
+def img_rgb_to_binary( img_path: Path, alg='otsu' ):
+    
+    color_img = ski.io.imread( img_path )
+    img_gray = ski.color.rgb2gray( color_img )
+    threshold_func = {
+            'otsu': ski.filters.threshold_otsu,
+            'niblack': ski.filters.threshold_niblack,
+            'sauvola': ski.filters.threshold_sauvola }
+    threshold_mask = threshold_func[alg]( img_gray )
+    binary_mask = img_gray > threshold_mask
+    return ski.util.img_as_ubyte( binary_mask )
