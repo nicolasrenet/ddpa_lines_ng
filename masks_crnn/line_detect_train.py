@@ -45,6 +45,7 @@ import fargv
 
 p = {
     'max_epoch': 250,
+    'max_epoch_force': -1,
     'img_paths': list(Path("dataset").glob('*.img.jpg')),
     'train_set_limit': 0,
     'line_segmentation_suffix': ".lines.gt.json",
@@ -436,6 +437,9 @@ if __name__ == '__main__':
         hyper_params.update( model.hyper_parameters )
     # TODO: partial overriding of param dictionary 
     # elif args.fine_tune
+    if args.max_epoch_force >= hyper_params['max_epoch']:
+        hyper_params['max_epoch']=args.max_epoch_force
+
     model.hyper_parameters = hyper_params
             
     random.seed(46)
@@ -472,8 +476,10 @@ if __name__ == '__main__':
     best_loss, best_epoch, lr = np.inf, -1, hyper_params['lr']
     if model.epochs:
         best_epoch,  best_loss = min([ (i, ep['validation_loss']) for i,ep in enumerate(model.epochs) ], key=lambda t: t[1])
-        lr = model.epochs[-1]['lr']
-    print(best_loss, best_epoch)
+        if 'lr' in model.epochs[-1]:
+            lr = model.epochs[-1]['lr']
+            print("Read start lR from last stored epoch: {}".format(lr))
+    print(f"Best validation loss ({best_loss}) at epoch {best_epoch}")
 
     optimizer = torch.optim.AdamW( model.net.parameters(), lr=lr )
     scheduler = ReduceLROnPlateau( optimizer, patience=hyper_params['scheduler_patience'], factor=hyper_params['scheduler_factor'] )
