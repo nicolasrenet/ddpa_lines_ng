@@ -489,14 +489,17 @@ def seals_regseg_to_crops( img: Image.Image, regseg: dict, region_labels: List[s
         region_labels (List[str]): Labels to be extracted.
 
     Returns:
-        Tuple[List[Image.Image], List[str]]: a pair with a list of images (H,W)> and a list of class names.
+        Tuple[List[Image.Image], List[str]]: a tuple with 
+            - a list of images (HWC)
+            - a list of box coordinates (LTRB)
+            - a list of class names
     """
-
     clsid_2_clsname = { i:n for (i,n) in enumerate( regseg['class_names'] )}
     to_keep = [ i for (i,v) in enumerate( regseg['rect_classes'] ) if clsid_2_clsname[v] in region_labels ]
 
-    return ( [ img.crop( regseg['rect_LTRB'][i] ) for i in to_keep ],
-             [ clsid_2_clsname[ regseg['rect_classes'][i]]  for i in to_keep ] )
+    return zip(*[ ( img.crop( regseg['rect_LTRB'][i] ), 
+                regseg['rect_LTRB'][i], 
+                clsid_2_clsname[ regseg['rect_classes'][i]]) for i in to_keep ])
 
 
 def seals_regseg_check_class(regseg: dict, region_labels: List[str] ) -> List[bool]:

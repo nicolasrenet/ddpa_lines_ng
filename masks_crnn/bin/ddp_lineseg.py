@@ -239,11 +239,13 @@ def build_nn( backbone='resnet101'):
             box_head=box_head,)
 
 
-def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.mlmodel' ):
+def predict( imgs: list[Union[Path,Image.Image,Tensor]], live_model=None, model_file='best.mlmodel' ):
     """
     Args:
         imgs (list[Union[Path,Tensor]]): lists of image filenames or tensors; in the latter case, images
-            are assumed to have been resized in a previous step.
+            are assumed to have been resized in a previous step (f.i. when predict() is used during the
+            training phase and consumes images from the dataset object.
+        live_model (SegModel): an instance of the segmentation model class.
         model_file (str): a saved model
     Returns:
         tuple[list[Tensor], list[dict]]: a tuple with 
@@ -262,7 +264,8 @@ def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.m
     model.net.eval()
 
     orig_sizes = []
-    if isinstance(imgs[0], Path) or type(imgs[0]) is str:
+    if isinstance(imgs[0], Path) or type(imgs[0]) is str or isinstance(imgs[0], Image.Image):
+        is_img = isinstance(imgs[0], Image.Image)
         img_size = model.hyper_parameters['img_size']
         width, height = (img_size[0],img_size[0]) if len(img_size)==1  else img_size
     
@@ -271,7 +274,7 @@ def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.m
             v2.Resize([ width,height]),
             v2.ToDtype(torch.float32, scale=True),
         ])
-        imgs_live = [ Image.open(img).convert('RGB') for img in imgs ]
+        imgs_live = imgs if is_img else [ Image.open(img).convert('RGB') for img in imgs ] 
         imgs, orig_sizes = zip(*[ (tsf(img), img.size) for img in imgs_live ])
     else:
         orig_sizes = [ img.shape[:0:-1] for img in imgs ]
