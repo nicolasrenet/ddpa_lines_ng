@@ -209,8 +209,7 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.25, orig_size=(
     return (labeled_msk, attributes)
 
 
-
-def split_set( *arrays, test_size=.2, random_state =46):
+def split_set( *arrays, test_size=.2, random_state=46):
     random.seed( random_state)
     seq = range(len(arrays[0]))
     train_set = set(random.sample( seq, int(len(arrays[0])*(1-test_size))))
@@ -219,7 +218,6 @@ def split_set( *arrays, test_size=.2, random_state =46):
     for a in arrays:
         sets.extend( [[ a[i] for i in train_set ], [ a[j] for j in test_set ]] )
     return sets
-
 
 def build_nn( backbone='resnet101'):
 

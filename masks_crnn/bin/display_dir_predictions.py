@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 import sys
 import matplotlib.pyplot as plt
+import random
 
 sys.path.append( str(Path(__file__).parents[1] ))
 import line_detect_train as ld
@@ -17,7 +18,9 @@ p = {
     'directory': '.',
     'color_count': (0, "-1 for single color, n > 1 for fixed number of colors, 0 for 1 color/line"),
     'limit': (5, "How many file to display."),
+    'random': 0,
 }
+
 
 if __name__ == '__main__':
 
@@ -25,7 +28,9 @@ if __name__ == '__main__':
 
     live_model = ld.SegModel.load( args.model_file )
 
-    for img_path in list(Path(args.directory).glob('*.jpg'))[:args.limit]:
+    files = random.sample(list(Path(args.directory).glob('*.jpg')), args.limit) if random else list(Path(args.directory).glob('*.jpg'))[:args.limit]
+
+    for img_path in files:
         #start = time.time()
         imgs_t, preds, sizes = ld.predict( [img_path], live_model=live_model)
 
