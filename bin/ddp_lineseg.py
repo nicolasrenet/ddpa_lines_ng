@@ -11,11 +11,14 @@ TODO:
 import sys
 import json
 from pathlib import Path
+from typing import Union, Any
+import random
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 from torch import nn 
+from torch.utils.tensorboard import SummaryWriter
 
 import torchvision
 import torchvision.transforms.v2 as v2
@@ -32,15 +35,11 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from tqdm.auto import tqdm
 
-from torch.utils.tensorboard import SummaryWriter
-from PIL import Image, ImageDraw
+from PIL import Image
 import skimage as ski
 import numpy as np
 import matplotlib.pyplot as plt
-import random
 
-import sys
-from typing import Union, Any
 import fargv
 
 sys.path.append('.')
@@ -50,7 +49,7 @@ from libs import segviz, seglib
 p = {
     'max_epoch': 250,
     'max_epoch_force': [-1, "If non-negative, this overrides a 'max_epoch' value read from a resumed model"],
-    'img_paths': list(Path("dataset").glob('*.img.jpg')),
+    'img_paths': set(list(Path("dataset").glob('*.img.jpg'))[:4]),
     'train_set_limit': [0, "If positive, train on a random sampling of the train set."],
     'validation_set_limit': [0, "If positive, validate on a random sampling of the train set (only for 'validate' mode of the script, not for epoch-validation during training)."],
     'line_segmentation_suffix': ".lines.gt.json",
@@ -514,9 +513,10 @@ if __name__ == '__main__':
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
             loss_dict = model.net(imgs, targets)
+            print(loss_dict)
             loss = sum( loss_dict.values()) 
             validation_losses.append( loss.detach())
-        return torch.stack( validation_losses).mean().item()    
+        return torch.stack( validation_losses ).mean().item()    
         
     def update_tensorboard(writer, epoch, training_loss, validation_loss):
         writer.add_scalar("Loss/train", training_loss, epoch)
@@ -605,8 +605,8 @@ if __name__ == '__main__':
     elif args.mode == 'validate':
         # 1st pass: mask-rcnn validation, for loss
         # TODO: detailed loss
-        #mean_validation_loss = validate()
-        #print('Validation loss: {:.4f}'.format(mean_validation_loss))
+        mean_validation_loss = validate()
+        print('Validation loss: {:.4f}'.format(mean_validation_loss))
 
         # 2nd pass: metrics on post-processed lines
         # use the same model

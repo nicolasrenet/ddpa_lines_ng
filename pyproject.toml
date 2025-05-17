@@ -1,0 +1,28 @@
+[project]
+name = "ddpa_lines"
+version = "2.0"
+authors = [
+  { name="Nicolas Renet", email="nprenet@gmail.com" },
+]
+description = "Line detection mini-app."
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [ "torch" ]
+
+[project.urls]
+Homepage = "https://github.com/Didip-eu/ddpa_lines"
+
+#[scripts]
+#pageconvert = pagexml2json:main
+
+
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
