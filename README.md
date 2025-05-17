@@ -1,1 +1,5 @@
-Embryo of a detection-based line segmentation app.
+Segmentation scripts, Kraken-free:
+
+- Training script for Mask-RCNN
+- Segmentation library: metrics
+- Mini-apps: detection, viewers
