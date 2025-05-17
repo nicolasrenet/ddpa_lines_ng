@@ -2,7 +2,7 @@
 
 """
 Read cropped writeable areas produced by the 'seals' app and 
-segment it into lines (use the Kraken engine, for now) 
+segment it into lines (use a Mask-RCNN engine).
 
 Example call::
 
@@ -175,7 +175,6 @@ if __name__ == "__main__":
                     # - N crop coordinates
                     # - N crop seg results, each with: label map + dictionary of attributes
                     segdict = build_segdict_composite( img, boxes, segmentation_records ) 
-                    sys.exit()
 
             # Option 2: single-file segmentation (no crops)
             else:
@@ -193,7 +192,6 @@ if __name__ == "__main__":
             logger.debug(f"Serializing segmentation for img.shape={img.size}")
 
             # JSON file (work from dict)
-            sys.exit()
             with open(output_file_path, 'w') as of:
                 segdict['image_wh']=img.size
                 json.dump( segdict, of )
