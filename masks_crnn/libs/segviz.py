@@ -5,6 +5,7 @@ from torch import Tensor
 from typing import Union,Callable
 import skimage as ski
 from torchvision.tv_tensors import BoundingBoxes, Mask
+from pathlib import Path
 
 
 
@@ -51,50 +52,24 @@ def display_line_masks_raw( preds: list[dict], box_threshold=.8, mask_threshold=
             plt.imshow( m*(m>mask_threshold) )
             plt.show()
 
-
-def display_random_predictions(count=2, model_file='best.mlmodel', random_state=46):
-    random.seed( random_state )
-    img_paths = random.sample( list(Path('dataset').glob('*.jpg')), count)
-    imgs_out, preds = predict( img_paths, model_file=model_file)
-    maps = [ post_process( p ) for p in preds ]
-    vizs = batch_visuals( [ {'img':img_t, 'id':str(path)} for img_t,path in zip(imgs_out, img_paths)], maps, color_count=0 )
-    for mp, atts, path in viz:
-        plt.imshow(mp)
-        plt.title(path)
-        for label, centroid, _, _ in atts:
-            plt.txt(*centroid[:0:-1], label, size=15)
-        plt.show()
-
-def display_dir_predictions(directory, model_file='best.mlmodel'):
-    import time
-    for img_path in list(Path(directory).glob('*.jpg')):
-        start = time.time()
-        img_t, out = predict( [img_path], model_file=model_file)
-        print("Prediction: {:.5f}s".format( time.time()-start))
-        start = time.time()
-        mp, atts, path = batch_visuals( [ {'img':img_t[0], 'id':str(img_path)} ], out, color_count=0 )[0]
-        print("Visual: {:.5f}s".format( time.time()-start))
-        plt.imshow( mp )
-        plt.title( path )
-        for label, centroid, _, _ in atts:
-            plt.txt(*centroid[:0:-1], label, size=15)
-        plt.show()
-
-def batch_visuals( inputs:list[Union[Tensor,dict]], raw_maps: list[tuple[np.ndarray,dict]], threshold=.2, color_count=-1, alpha=.4):
+def batch_visuals( inputs:list[Union[Tensor,dict,Path]], raw_maps: list[tuple[np.ndarray,dict]], color_count=-1, alpha=.4):
     """
     Given a list of image tensors and a list of tuples (<labeled map>,<attributes>), returns page images
     with mask overlays, as well as attributes.
 
     Args:
-        inputs (list[Tensor]): a list of image tensors, or dictionaries with 'img' tensor
+        inputs (list[Tensor]): a list of 
+            - image tensors
+            - dictionaries with 'img' tensor
+            - image paths
         raw_maps (list[tuple[np.ndarray,dict]]): a list of tuples with
             - labeled map 
             - attributes: i.e. dictionary of the form `{'masks': ..., 'boxes': ..., 'scores': ... }`
     Returns:
         list[tuple[np.array, dict, str]]: a list of tuples (img_HWC, attributes, id)
     """
-    assert isinstance(inputs[0], Tensor) or ( type(inputs[0]) is dict and 'img' in inputs[0] )
-
+    assert (isinstance(inputs[0], Tensor) or ( type(inputs[0]) is dict and 'img' in inputs[0] )) or isinstance(inputs[0], Path)
+    
     imgs, ids, maps, attr = [], [], [], []
     if isinstance(inputs[0], Tensor):
         imgs = [ img.cpu().numpy() for img in inputs ] 
@@ -102,6 +77,10 @@ def batch_visuals( inputs:list[Union[Tensor,dict]], raw_maps: list[tuple[np.ndar
     elif type(inputs[0]) is dict and 'img' in inputs[0]:
         imgs=[ img['img'].cpu().numpy() for img in inputs ]
         ids = [ img['id'] if 'id' in img else f'image-{i}' for (i,img) in enumerate(inputs) ] 
+    elif isinstance(inputs[0], Path):
+        imgs,ids=zip(*[ (np.transpose(ski.io.imread(img),(2,0,1)).astype('float32')/255, str(img.name)) for img in inputs ])
+    #print([ (Id,img.shape, img.dtype, np.ptp(img)) for img,Id in zip(imgs,ids) ])
+    assert all([ img.shape[1:] == mp[0].shape[1:] for img,mp in zip(imgs,raw_maps) ])
 
     default_color = [0,0,1.0] # BLUE
     for img,mp in zip(imgs,raw_maps):

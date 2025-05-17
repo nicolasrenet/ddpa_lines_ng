@@ -171,7 +171,7 @@ class RandomElasticGrid(v2.Transform):
             return inpt
         return grid_wave_t( inpt, grid_cols=params['grid_cols'], random_state=params['random_state'])
 
-def post_process( preds: dict, box_threshold=.9, mask_threshold=.4):
+def post_process( preds: dict, box_threshold=.9, mask_threshold=.25, orig_size=()):
     """
     Compute lines from predictions.
 
@@ -179,23 +179,30 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.4):
         preds (dict[str,torch.Tensor]): predicted dictionary for the page:
             - 'scores'(N) : box probs
             - 'masks' (NHW): line heatmaps
+            - 'orig_size': if provided, masks are rescaled to the respective size
     Returns:
         tuple[ np.ndarray, list[tuple[int, list, float, list]]]: a pair with
             - labeled map(1,H,W)
             - a list of line attribute tuples (label, centroid pt, area, polygon coords.)
     """
-    # select masks
+    # select masks with best box scores
     best_masks = [ m.detach().numpy() for m in preds['masks'][preds['scores']>box_threshold]]
     # threshold masks
     masks = [ m * (m > mask_threshold) for m in best_masks ]
 
     # merge masks 
     page_wide_mask = np.sum( masks, axis=0 ).astype('bool')
+
+    # optional: scale up masks to the original size of the image
+    if orig_size:
+        page_wide_mask = ski.transform.resize( page_wide_mask, (1, orig_size[1], orig_size[0]))
+
     # label components
     labeled_msk = ski.measure.label( page_wide_mask, connectivity=1 )
-    #return labeled_msk
+    
     # sort label from top to bottom (using centroids of labeled regions)
     # note: labels are [1,H,W]. Accordingly, centroids are 3-tuples.
+    attributes=[]
     attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords) for reg in ski.measure.regionprops( labeled_msk ) ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
     if [ att[0] for att in attributes ] != list(range(1, np.max(labeled_msk)+1)):
         print("Labels do not follow reading order")
@@ -237,12 +244,14 @@ def build_nn( backbone='resnet101'):
 def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.mlmodel' ):
     """
     Args:
-        imgs (list[Union[Path,Tensor]]): lists of image filenames or tensors.
+        imgs (list[Union[Path,Tensor]]): lists of image filenames or tensors; in the latter case, images
+            are assumed to have been resized in a previous step.
         model_file (str): a saved model
     Returns:
         tuple[list[Tensor], list[dict]]: a tuple with 
         - the resized images (as tensors)
         - a list of prediction dictionaries.
+        - a list of tuples (width,height) storing size of the original input img
     """
     assert type(imgs) is list
 
@@ -254,6 +263,7 @@ def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.m
     model.net.cpu()
     model.net.eval()
 
+    orig_sizes = []
     if isinstance(imgs[0], Path) or type(imgs[0]) is str:
         img_size = model.hyper_parameters['img_size']
         width, height = (img_size[0],img_size[0]) if len(img_size)==1  else img_size
@@ -263,9 +273,12 @@ def predict( imgs: list[Union[Path,Tensor]], live_model=None, model_file='best.m
             v2.Resize([ width,height]),
             v2.ToDtype(torch.float32, scale=True),
         ])
-        imgs = [ tsf( Image.open(img).convert('RGB')) for img in imgs ]
+        imgs_live = [ Image.open(img).convert('RGB') for img in imgs ]
+        imgs, orig_sizes = zip(*[ (tsf(img), img.size) for img in imgs_live ])
+    else:
+        orig_sizes = [ img.shape[:0:-1] for img in imgs ]
         
-    return (imgs, model.net( imgs ))
+    return (imgs, model.net( imgs ), orig_sizes)
     
 
 class SegModel():
@@ -415,7 +428,7 @@ class ChartersDataset(Dataset):
             # Generate bounding box annotations from segmentation masks
             #bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
             #return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
-            return img, {'masks': masks, 'labels': labels, 'path': img_path}
+            return img, {'masks': masks, 'labels': labels, 'path': img_path, 'orig_size': img.size }
 
 ### Training 
 if __name__ == '__main__':

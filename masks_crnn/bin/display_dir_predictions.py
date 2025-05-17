@@ -1,0 +1,49 @@
+
+from pathlib import Path
+import time
+import sys
+import matplotlib.pyplot as plt
+
+sys.path.append( str(Path(__file__).parents[1] ))
+import line_detect_train as ld
+from libs import segviz
+
+import fargv
+
+p = {
+    'model_file': 'best.mlmodel',
+    'mask_threshold': 0.25,
+    'rescale': 0,
+    'directory': '.',
+    'color_count': (0, "-1 for single color, n > 1 for fixed number of colors, 0 for 1 color/line"),
+    'limit': (5, "How many file to display."),
+}
+
+if __name__ == '__main__':
+
+    args, _ = fargv.fargv(p)
+
+    live_model = ld.SegModel.load( args.model_file )
+
+    for img_path in list(Path(args.directory).glob('*.jpg'))[:args.limit]:
+        #start = time.time()
+        imgs_t, preds, sizes = ld.predict( [img_path], live_model=live_model)
+
+        #print("Prediction: {:.5f}s".format( time.time()-start))
+
+        maps = []
+        #start = time.time()
+        if args.rescale:
+            maps=[ ld.post_process( p, orig_size=sz, mask_threshold=args.mask_threshold ) for (p,sz) in zip(preds,sizes) ]
+            mp, atts, path = segviz.batch_visuals( [img_path], maps, color_count=0 )[0]
+        else:
+            maps=[ ld.post_process( p, mask_threshold=args.mask_threshold ) for p in preds ]
+            mp, atts, path = segviz.batch_visuals( [ {'img':imgs_t[0], 'id':str(img_path)} ], maps, color_count=0 )[0]
+        #print("Visual: {:.5f}s".format( time.time()-start))
+
+        plt.imshow( mp )
+        plt.title( path )
+        for label, centroid, _, _ in atts:
+            plt.text(*centroid[:0:-1], label, size=15)
+        plt.show()
+
