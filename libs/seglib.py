@@ -104,18 +104,19 @@ def polygon_map_from_segmentation_dict( segmentation_dict: dict ) -> Tensor:
     return polygon_img
 
 
-def line_binary_mask_from_json_file(segmentation_json: str ) -> Tensor:
+def line_binary_mask_from_json_file(segmentation_json: str, polygon_key='boundary' ) -> Tensor:
     """From a segmentation dictionary describing polygons, return a boolean mask where any pixel belonging
     to a polygon is 1 and the other pixels 0.
 
     Args:
         segmentation_json (str): a JSON file describing the lines.
+        polygon_key (str): polygon dictionary entry.
 
     Returns:
         Tensor: a flat boolean tensor with size (H,W)
     """
     with open( segmentation_json, 'r' ) as json_file:
-        return line_binary_mask_from_segmentation_dict( json.load( json_file ))
+        return line_binary_mask_from_segmentation_dict( json.load( json_file ), polygon_key)
 
 def line_binary_mask_from_xml_file( page_xml: str ) -> Tensor:
     """From a PageXML file describing polygons, return a boolean mask where any pixel belonging
@@ -131,21 +132,22 @@ def line_binary_mask_from_xml_file( page_xml: str ) -> Tensor:
     return line_binary_mask_from_segmentation_dict( segmentation_dict )
 
 
-def line_binary_mask_from_segmentation_dict( segmentation_dict: dict ) -> Tensor:
+def line_binary_mask_from_segmentation_dict( segmentation_dict: dict, polygon_key='boundary' ) -> Tensor:
     """From a segmentation dictionary describing polygons, return a boolean mask where any pixel belonging
     to a polygon is 1 and the other pixels 0.
     Note: masks can be built from a polygon map and an arbitrary selection function, with
     the mask_from_polygon_map_functional() function below.
 
     Args:
-        segmentation_dict (dict): a dictionary, typically constructed
-            from a JSON file.
+        segmentation_dict (dict): a dictionary, typically constructed from a JSON file.
+        polygon_key (str): polygon dictionary entry.
+
 
     Returns:
         Tensor: a flat boolean tensor with size (H,W)
     """
 
-    polygon_boundaries = [ line['boundary'] for line in segmentation_dict['lines'] ]
+    polygon_boundaries = [ line[polygon_key] for line in segmentation_dict['lines'] ]
 
     # create 2D boolean matrix
     mask_size = segmentation_dict['image_wh'][::-1]
@@ -487,14 +489,17 @@ def seals_regseg_to_crops( img: Image.Image, regseg: dict, region_labels: List[s
         region_labels (List[str]): Labels to be extracted.
 
     Returns:
-        Tuple[List[Image.Image], List[str]]: a pair with a list of images (H,W)> and a list of class names.
+        Tuple[List[Image.Image], List[str]]: a tuple with 
+            - a list of images (HWC)
+            - a list of box coordinates (LTRB)
+            - a list of class names
     """
-
     clsid_2_clsname = { i:n for (i,n) in enumerate( regseg['class_names'] )}
     to_keep = [ i for (i,v) in enumerate( regseg['rect_classes'] ) if clsid_2_clsname[v] in region_labels ]
 
-    return ( [ img.crop( regseg['rect_LTRB'][i] ) for i in to_keep ],
-             [ clsid_2_clsname[ regseg['rect_classes'][i]]  for i in to_keep ] )
+    return zip(*[ ( img.crop( regseg['rect_LTRB'][i] ), 
+                regseg['rect_LTRB'][i], 
+                clsid_2_clsname[ regseg['rect_classes'][i]]) for i in to_keep ])
 
 
 def seals_regseg_check_class(regseg: dict, region_labels: List[str] ) -> List[bool]:
@@ -693,8 +698,59 @@ def array_has_label( label_map_hw: np.ndarray, label: int ) -> bool:
     return bool(np.any( label_cube_chw == label ))
 
 
+def polygon_pixel_metrics_two_flat_maps( map_hw_1: np.ndarray, map_hw_2: np.ndarray, label_distance=5) -> np.ndarray:
+    """Provided two label maps that each encode _non_overlapping_ polygons, compute
+    for each possible pair of labels (i_pred, j_gt) with i ∈  map1 and j ∈  map2.
+    + intersection and union counts
+    + precision and recall
 
-def polygon_pixel_metrics_two_maps( map_chw_1: Tensor, map_chw_2: Tensor, label_distance=5) -> np.ndarray:
+    Shared pixels in each map (i.e. overlapping polygons) have their weight decreased according
+    to the number of polygons they vote for.
+
+    Args:
+        map_hw_1 (np.ndarray): the predicted map, i.e. a flat map of labeled polygons.
+            overlaps.
+        map_hw_2 (np.ndarray): the GT map, i.e. a flat map of labeled polygons.
+
+    Returns:
+        np.ndarray: a 4 channel array, where each cell [i,j] stores respectively intersection and union
+            counts, as well as precision and recall for a pair of labels [i,j].
+    """
+    min_label_1, max_label_1 = int(np.min( map_hw_1[ map_hw_1 > 0 ] ).item()), int(np.max( map_hw_1 ).item())
+    min_label_2, max_label_2 = int(np.min( map_hw_2[ map_hw_2 > 0 ] ).item()), int(np.max( map_hw_2 ).item())
+    label2index_1 = { l:i for i,l in enumerate( range(min_label_1, max_label_1+1)) }
+    label2index_2 = { l:i for i,l in enumerate( range(min_label_2, max_label_2+1)) }
+    metrics_hwc = np.zeros(( max_label_1-min_label_1+1, max_label_2-min_label_2+1, 4), dtype='float32')
+    label_range_1, label_range_2 = range(min_label_1, max_label_1+1), range(min_label_2, max_label_2+1)
+    #print("Ranges: ({}->{}), ({}->{})".format(min_label_1, max_label_1, min_label_2, max_label_2))
+
+    # retrieve individual masks for each label and stack them up
+    label_matrices_1={ l:(map_hw_1 == l) for l in label_range_1 }
+    label_matrices_2={ l:(map_hw_2 == l) for l in label_range_2 }
+
+    #print(label_range_1, label_range_2)
+    label_counts_1 = { l:np.sum(label_matrices_1[l]).item() for l in label_range_1 }
+    label_counts_2 = { l:np.sum(label_matrices_2[l]).item() for l in label_range_2 }
+
+    for lbl1, lbl2 in itertools.product(label_range_1, label_range_2):
+        if label_distance > 0 and abs(lbl1-lbl2) > label_distance:
+            metrics_hwc[label2index_1[lbl1], label2index_2[lbl2]]=[ 0, label_counts_1[lbl1] + label_counts_2[lbl2], 0, 0 ]
+            continue
+        # intersection
+        intersection_count = np.sum(label_matrices_1[ lbl1 ] * label_matrices_2[ lbl2 ]).item()
+        label_1_count, label_2_count = np.sum(label_matrices_1[lbl1]), np.sum(label_matrices_2[lbl2])  
+        union_count = label_1_count + label_2_count - intersection_count
+        # precision: true pred / all pred
+        if label_1_count != 0:
+            precision = intersection_count / label_1_count
+        # recall: true pred / all gt
+        if label_2_count !=0:
+            recall = intersection_count / label_2_count
+        metrics_hwc[label2index_1[lbl1], label2index_2[lbl2]] = [intersection_count, union_count, precision, recall ]
+    return metrics_hwc
+
+
+def polygon_pixel_metrics_two_deep_maps( map_chw_1: Tensor, map_chw_2: Tensor, label_distance=5) -> np.ndarray:
     """Provided two label maps that each encode (potentially overlapping) polygons, compute
     for each possible pair of labels (i_pred, j_gt) with i ∈  map1 and j ∈  map2.
     + intersection and union counts
@@ -705,7 +761,7 @@ def polygon_pixel_metrics_two_maps( map_chw_1: Tensor, map_chw_2: Tensor, label_
 
     Args:
         map_chw_1 (Tensor): the predicted map, i.e. a 4-channel map with labeled polygons, with potential overlaps.
-        map_hw_2 (Tensor): the GT map, i.e. a 4-channel map with labeled polygons, with potential overlaps.
+        map_chw_2 (Tensor): the GT map, i.e. a 4-channel map with labeled polygons, with potential overlaps.
 
     Returns:
         np.ndarray: a 4 channel array, where each cell [i,j] stores respectively intersection and union
@@ -788,14 +844,14 @@ def map_to_depth(map_chw: Tensor) -> Tensor:
     return depth_map
 
 
-def polygon_pixel_metrics_to_line_based_scores( metrics: np.ndarray, threshold: float=.5 ) -> Tuple[float, float, float, float, float]:
+def polygon_pixel_metrics_to_line_based_scores_icdar_2017( metrics: np.ndarray, threshold: float=.5 ) -> Tuple[float, float, float, float, float]:
     """Implement ICDAR 2017 evaluation metrics, as described in
     https://github.com/DIVA-DIA/DIVA_Line_Segmentation_Evaluator/releases/tag/v1.0.0
     (a Java implementation)
 
     IoU = TP / (TP+FP+FN)
     F1 = (2*TP) / (2*TP+FP+FN)
-
+ 
     + find all polygon pairs that have a non-empty intersection
     + sort the pairs by IoU
     + traverse the IoU-descending sorted list and select the first available match
@@ -810,6 +866,7 @@ def polygon_pixel_metrics_to_line_based_scores( metrics: np.ndarray, threshold: 
         metrics (np.ndarray): metrics matrix, with indices [0..m-1, 0..n-1] for labels 1..m, 
             where m and n are the max. labels of of the predicted and GT maps respectively.
             In the channels: intersection count, union count, precision, recall.
+        threshold (float): IoU threshold for TP
 
     Returns:
         tuple: a 5-tuple with the TP-, FP-, and FN-counts, as well as the Jaccard (aka. IoU)
@@ -865,6 +922,99 @@ def polygon_pixel_metrics_to_line_based_scores( metrics: np.ndarray, threshold: 
 
     return (TP, FP, FN, Jaccard, F1)
 
+def polygon_pixel_metrics_to_line_based_scores( metrics_hwc: np.ndarray, threshold: float=.5 ) -> Tuple[float, float, float, float, float]:
+    """Classic evalution metrics, where mask are matched based on the best IoU.
+
+    IoU = TP / (TP+FP+FN)
+    F1 = (2*TP) / (2*TP+FP+FN)
+ 
+    + find all polygon pairs that have a non-empty intersection
+    + sort the pairs by IoU
+    + traverse the IoU-descending sorted list and select the first available match
+      for each polygon belonging to the prediction set (thus ensuring that no
+      polygon can be matched twice)
+    + a pred/GT match is TP if IoU > threshold; any unmatched predicted label is FP
+    + any unmatched GT label is a FN
+
+    Args:
+        metrics (np.ndarray): metrics matrix, with indices [0..m-1, 0..n-1] for labels 1..m, 
+            where m and n are the max. labels of of the predicted and GT maps respectively.
+            In the channels: intersection count, union count, precision, recall.
+        threshold (float): IoU threshold for TP
+
+    Returns:
+        tuple: a 3-tuple with the TP-, FP-, and FN-counts.
+    """
+    label_count_pred, label_count_gt = metrics_hwc.shape[:2]
+
+    # keep only IoU, with preds in rows, gt in cols
+    pred_gt_ious = metrics_hwc[:,:,0]/metrics_hwc[:,:,1]
+    #print(pred_gt_ious)
+
+    pred_to_gt = {}
+    best_match_iou = {}
+    fp = 0
+
+    # match each predicted with its unique gt line, based on best IoU
+    # TODO
+    for lpred in range(label_count_pred):
+        for lgt in range(label_count_gt):
+            iou = pred_gt_ious[lpred,lgt]
+            if iou > threshold:
+                pred_to_gt[ lpred ] = lgt
+    #print(pred_to_gt)
+    # false positives: all those predictions that do not have a match with GT
+    fp = len(set(range(label_count_pred)) - set(pred_to_gt.keys()))
+    fn = len(set(range(label_count_gt)) - set(pred_to_gt.values()))
+    tp = len(pred_to_gt.items())
+    out = (tp, fp, fn)
+    #print(out, f"R={tp/(tp+fn)}", f"P={tp/(tp+fp)}")
+    return out
+
+
+def mAP( pixel_metrics_list: list[np.ndarray] ):
+    """
+    mAP = (AP_.5 + AP.55 + ... + AP.95) / 10
+
+    where
+        AP_<thr> is obtained as follow:
+        + sort all predicted lines by confidence score (or IoU)
+        + for each entry: compute accumulated TP_<thr>, FP_<thr>, Prec, Rec
+        + (optional) plot PR curve
+
+    Args:
+        pixels_metrics_list (list[np.ndarray]): a list of page-wide, 2-mask pixel metrics, as computed by 
+            `polygon_pixel_metrics_two_flat_maps`.
+    Return:
+        tuple[float,list[tuple[float,float]]]: a tuple with
+            - mAP across all IoU thresholds
+            - sorted sequence of (precision,recall) values
+    """
+    av_metrics = np.zeros((len(pixel_metrics_list),10,3)); # dims: samples,thresholds, metrics
+    for i, pm in enumerate(pixel_metrics_list):
+        for t,thrld in enumerate(np.linspace(.5,.95,10)): 
+            av_metrics[i,t] = polygon_pixel_metrics_to_line_based_scores( pm, threshold=thrld )
+#            if t == 3 or t==8:
+#                print("Map {}, threshold {}: {} -".format(i, thrld, av_metrics[i,t]))
+#    print("Metrics shape:", av_metrics.shape)
+#    # sum over all samples
+    tp_fp_fn = np.sum( av_metrics, axis=0 ) 
+    print('TP|FP|FN')
+    print(tp_fp_fn)
+    # TP/(TP+FP), TP/(TP+FN) for all thresholds 
+    recall = tp_fp_fn[:,0] / (tp_fp_fn[:,0]+tp_fp_fn[:,2]) 
+    precision = tp_fp_fn[:,0] / (tp_fp_fn[:,0]+tp_fp_fn[:,1]) 
+    print("R:", recall)
+    print("P:", precision)
+
+
+    return {
+            'mAP50': precision[0], 
+            'mAP75': precision[5], 
+            'mAP50_95': np.sum(precision)/10, 
+            'recall/precision': list(zip( recall.tolist(), precision.tolist()))}
+    
+
 
 def polygon_pixel_metrics_to_pixel_based_scores( metrics: np.ndarray) -> Tuple[float, float]:
     """Implement ICDAR 2017 pixel-based evaluation metrics, as described in
@@ -873,7 +1023,7 @@ def polygon_pixel_metrics_to_pixel_based_scores( metrics: np.ndarray) -> Tuple[f
 
     Two versions of the pixel-based IoU metric:
     + Pixel IU takes all pixels of all intersecting pairs into account
-    + Matched Pixel IU only takes into account the pixels fro m the matched lines
+    + Matched Pixel IU only takes into account the pixels from the matched lines
 
     TODO: verify that threshold value is not relevant for this metric.
 
