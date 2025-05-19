@@ -62,21 +62,26 @@ p = {
 
 def build_segdict( img, segmentation_record, contour_tolerance=4.0 ):
     """
-    TODO: page-wide keys (name, size, etc.)
+    TODO: 
+        - page-wide keys (name, size, etc.)
+        - use area and axis-length to compute line height
+        - compute polygon skeleton -> baseline (need to compute straight skeleton, but python implementations do not abound)
     Args:
         img (Image.Image): the original image
         segmentation_record (tuple[np.ndarray, list[tuple]]): a tuple with
             - label map (np.ndarray)
-            - a list of line attribute tuples (label, centroid pt, ..., area, polygon_coords)
+            - a list of line attribute dicts (label, centroid pt, ..., area, polygon_coords)
         contour_tolerance (float): value for contour approximation (default: 4)
     Return:
         dict: a segmentation dictionary
     """
+
     segdict = {'lines':[] }
     mp, atts = segmentation_record
-    for label, _, _, polygon_coords in atts:
-        if label==1:
-            print(polygon_coords[:,1:], "shape=", polygon_coords[:,1:].shape)
+    for att_dict in atts:
+        label, polygon_coords, area, axis_major_length = [ att_dict[k] for k in ('label','coords','area','axis_major_length')]
+        #if label==1:
+        #    print(polygon_coords[:,1:], "shape=", polygon_coords[:,1:].shape)
         segdict['lines'].append({ 'id': label, 'boundary': ski.measure.approximate_polygon( polygon_coords[:,1:], tolerance=contour_tolerance).tolist()})
     #print(segdict)
     return segdict
@@ -85,6 +90,8 @@ def build_segdict( img, segmentation_record, contour_tolerance=4.0 ):
 def build_segdict_composite( img, boxes, segmentation_records, contour_tolerance=4.0):
     """
     TODO: page-wide keys (name, size, etc.)
+        - use area and axis-length to compute line height
+        - compute polygon skeleton -> baseline
 
     Args:
         img (Image.Image): the original image
@@ -92,7 +99,7 @@ def build_segdict_composite( img, boxes, segmentation_records, contour_tolerance
         segmentation_records (list[tuple[np.ndarray, list[tuple]]]): a list of N tuples (one
         per region) with
             - label map (np.ndarray)
-            - a list of line attribute tuples (label, centroid pt, ..., area, polygon_coords)
+            - a list of line attribute dicts (label, centroid pt, ..., area, polygon_coords)
         contour_tolerance (float): value for contour approximation (default: 4)
 
     Return:
@@ -103,11 +110,9 @@ def build_segdict_composite( img, boxes, segmentation_records, contour_tolerance
     print('build_segdict_composite')
     for box, record in zip(boxes, segmentation_records):
         _, atts = record
-        print(type(atts))
         # adding the box offset
-        for label, _, _, polygon_coords in atts:
-            if label==1:
-                print(polygon_coords[:,1:], "shape=", polygon_coords[:,1:].shape)
+        for att_dict in atts:
+            label, polygon_coords, area, axis_major_length = [ att_dict[k] for k in ('label','coords','area','axis_major_length')]
             offset_polygon = ski.measure.approximate_polygon( polygon_coords[:,1:] + box[:2], tolerance=contour_tolerance).tolist()
             segdict['lines'].append( { 'boundary': offset_polygon })
     return segdict

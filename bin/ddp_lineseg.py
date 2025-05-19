@@ -4,7 +4,9 @@
 
 TODO:
 
++ proper logging
 + time estimate
++ code clean-up
 
 """
 
@@ -49,7 +51,7 @@ from libs import segviz, seglib
 p = {
     'max_epoch': 250,
     'max_epoch_force': [-1, "If non-negative, this overrides a 'max_epoch' value read from a resumed model"],
-    'img_paths': set(list(Path("dataset").glob('*.img.jpg'))[:4]),
+    'img_paths': set(list(Path("dataset").glob('*.img.jpg'))),
     'train_set_limit': [0, "If positive, train on a random sampling of the train set."],
     'validation_set_limit': [0, "If positive, validate on a random sampling of the train set (only for 'validate' mode of the script, not for epoch-validation during training)."],
     'line_segmentation_suffix': ".lines.gt.json",
@@ -170,6 +172,67 @@ class RandomElasticGrid(v2.Transform):
             return inpt
         return grid_wave_t( inpt, grid_cols=params['grid_cols'], random_state=params['random_state'])
 
+
+
+
+def post_process_two_maps( preds1: dict, preds2: dict, height: int, box_threshold=.9, mask_threshold=.25, orig_size=()):
+    """
+    NOT FUNCTIONAL! Compute lines from predictions.
+
+    Args:
+        preds1 (dict[str,torch.Tensor]): predicted dictionary for the top of the page:
+            - 'scores'(N) : box probs
+            - 'masks' (NHW): line heatmaps
+            - 'orig_size': if provided, masks are rescaled to the respective size
+        preds2 (dict[str,torch.Tensor]): predicted dictionary for the bottom of the page:
+        offset (int): height ratio of patch wr/ original image
+    Returns:
+        tuple[ np.ndarray, list[tuple[int, list, float, list]]]: a pair with
+            - labeled map(1,H,W)
+            - a list of line attribute dicts (label, centroid pt, area, polygon coords.)
+    """
+    # select masks with best box scores
+    best_masks_1 = [ m.detach().numpy() for m in preds1['masks'][preds1['scores']>box_threshold]]
+    best_masks_2 = [ m.detach().numpy() for m in preds2['masks'][preds2['scores']>box_threshold]]
+    # threshold masks
+    masks_1 = [ m * (m > mask_threshold) for m in best_masks_1 ]
+    masks_2 = [ m * (m > mask_threshold) for m in best_masks_2 ]
+    print("masks_1.shape=",masks_1[0].shape)
+    print("masks_2.shape=",masks_1[0].shape)
+
+    # merge line masks in each patch
+    page_wide_mask_1 = np.sum( masks_1, axis=0 ).astype('bool')
+    page_wide_mask_2 = np.sum( masks_1, axis=0 ).astype('bool')
+    print("page_wide_mask_1.shape=",page_wide_mask_1.shape)
+    print("page_wide mask_2.shape=",page_wide_mask_2.shape)
+
+    # combine 2 overlapping masks
+    patch_height, patch_width = page_wide_mask_1.shape[1:]
+    page_wide_mask = np.zeros( (1, height, patch_width ))
+    page_wide_mask[:,:patch_height]=page_wide_mask_1
+    page_wide_mask[:,patch_height:]=page_wide_mask_2
+
+    # optional: scale up masks to the original size of the image
+    if orig_size:
+        page_wide_mask = ski.transform.resize( page_wide_mask, (1, orig_size[1], orig_size[0]))
+
+    # label components
+    labeled_msk = ski.measure.label( page_wide_mask, connectivity=1 )
+    
+    # sort label from top to bottom (using centroids of labeled regions)
+    # note: labels are [1,H,W]. Accordingly, centroids are 3-tuples.
+    region_properties = ski.measure.regionprops( labeled_msk )
+    # last attribute is an estimate of the line height (Area/<major-axis length>)
+    attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords, reg.axis_major_length) for reg in region_properties ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
+    if [ att[0] for att in attributes ] != list(range(1, np.max(labeled_msk)+1)):
+        print("Labels do not follow reading order")
+    return (labeled_msk, 
+            [ {'label': att[0], 
+            'centroid': att[1], 
+            'area': att[2], 
+            'coords': att[3], 
+            'axis_major_length': att[4]} for att in attributes ])
+
 def post_process( preds: dict, box_threshold=.9, mask_threshold=.25, orig_size=()):
     """
     Compute lines from predictions.
@@ -182,7 +245,7 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.25, orig_size=(
     Returns:
         tuple[ np.ndarray, list[tuple[int, list, float, list]]]: a pair with
             - labeled map(1,H,W)
-            - a list of line attribute tuples (label, centroid pt, area, polygon coords.)
+            - a list of line attribute dicts (label, centroid pt, area, polygon coords.)
     """
     # select masks with best box scores
     best_masks = [ m.detach().numpy() for m in preds['masks'][preds['scores']>box_threshold]]
@@ -201,11 +264,17 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.25, orig_size=(
     
     # sort label from top to bottom (using centroids of labeled regions)
     # note: labels are [1,H,W]. Accordingly, centroids are 3-tuples.
-    attributes=[]
-    attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords) for reg in ski.measure.regionprops( labeled_msk ) ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
+    region_properties = ski.measure.regionprops( labeled_msk )
+    # last attribute is an estimate of the line height (Area/<major-axis length>)
+    attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords, reg.axis_major_length) for reg in region_properties ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
     if [ att[0] for att in attributes ] != list(range(1, np.max(labeled_msk)+1)):
         print("Labels do not follow reading order")
-    return (labeled_msk, attributes)
+    return (labeled_msk, 
+            [ {'label': att[0], 
+            'centroid': att[1], 
+            'area': att[2], 
+            'coords': att[3], 
+            'axis_major_length': att[4]} for att in attributes ])
 
 
 def split_set( *arrays, test_size=.2, random_state=46):
@@ -238,7 +307,7 @@ def build_nn( backbone='resnet101'):
             box_head=box_head,)
 
 
-def predict( imgs: list[Union[Path,Image.Image,Tensor]], live_model=None, model_file='best.mlmodel' ):
+def predict( imgs: list[Union[str,Path,Image.Image,Tensor,np.ndarray]], live_model=None, model_file='best.mlmodel' ):
     """
     Args:
         imgs (list[Union[Path,Tensor]]): lists of image filenames or tensors; in the latter case, images
@@ -263,17 +332,20 @@ def predict( imgs: list[Union[Path,Image.Image,Tensor]], live_model=None, model_
     model.net.eval()
 
     orig_sizes = []
-    if isinstance(imgs[0], Path) or type(imgs[0]) is str or isinstance(imgs[0], Image.Image):
-        is_img = isinstance(imgs[0], Image.Image)
-        img_size = model.hyper_parameters['img_size']
-        width, height = (img_size[0],img_size[0]) if len(img_size)==1  else img_size
-    
-        tsf = v2.Compose([
-            v2.ToImage(),
-            v2.Resize([ width,height]),
-            v2.ToDtype(torch.float32, scale=True),
-        ])
-        imgs_live = imgs if is_img else [ Image.open(img).convert('RGB') for img in imgs ] 
+    img_size = model.hyper_parameters['img_size']
+    width, height = (img_size[0],img_size[0]) if len(img_size)==1  else img_size
+    tsf = v2.Compose([
+        v2.ToImage(),
+        v2.Resize([ width,height]),
+        v2.ToDtype(torch.float32, scale=True),
+    ])
+    # every input that is not a tensor needs both resizing and tensor-ification
+    if not isinstance(imgs[0], Tensor):
+        imgs_live = []
+        if isinstance(imgs[0], Path) or type(imgs[0]) is str:
+            imgs_live = [ Image.open(img).convert('RGB') for img in imgs ]
+        elif isinstance(imgs[0], Image.Image) or type(imgs[0]) is np.ndarray:
+            imgs_live = imgs
         imgs, orig_sizes = zip(*[ (tsf(img), img.size) for img in imgs_live ])
     else:
         orig_sizes = [ img.shape[:0:-1] for img in imgs ]
@@ -461,9 +533,9 @@ if __name__ == '__main__':
         hyper_params['max_epoch']=args.max_epoch_force
 
     model.hyper_parameters = hyper_params
-            
+
     random.seed(46)
-    imgs = random.sample( args.img_paths, hyper_params['train_set_limit']) if hyper_params['train_set_limit'] else args.img_paths
+    imgs = random.sample( args.img_paths, hyper_params['train_set_limit']) if hyper_params['train_set_limit'] else list(args.img_paths)
     lbls = [ str(img_path).replace('.img.jpg', args.line_segmentation_suffix) for img_path in imgs ]
 
     # split sets
@@ -506,6 +578,8 @@ if __name__ == '__main__':
 
     def validate():
         validation_losses = []
+        loss_box_reg = []
+        loss_mask = []
         batches = iter(dl_val)
         for batch_index in (pbar := tqdm( range(len( batches )))):
             pbar.set_description('Validate')
@@ -513,9 +587,12 @@ if __name__ == '__main__':
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
             loss_dict = model.net(imgs, targets)
-            print(loss_dict)
             loss = sum( loss_dict.values()) 
             validation_losses.append( loss.detach())
+            loss_box_reg.append( loss_dict['loss_box_reg'].detach())
+            loss_mask.append( loss_dict['loss_mask'].detach())
+        print( "Loss boxes: {}".format( torch.stack(loss_box_reg).mean().item()))
+        print( "Loss masks: {}".format( torch.stack(loss_mask).mean().item()))
         return torch.stack( validation_losses ).mean().item()    
         
     def update_tensorboard(writer, epoch, training_loss, validation_loss):
@@ -604,7 +681,6 @@ if __name__ == '__main__':
     # validation + metrics
     elif args.mode == 'validate':
         # 1st pass: mask-rcnn validation, for loss
-        # TODO: detailed loss
         mean_validation_loss = validate()
         print('Validation loss: {:.4f}'.format(mean_validation_loss))
 
@@ -616,11 +692,18 @@ if __name__ == '__main__':
             print(f'{i}: computing gt_map...', end='')
             gt_map = segviz.gt_masks_to_labeled_map( target['masks'] )
             print(f'computing pred_map...', end='')
-            imgs, preds = predict( [img], live_model=model ) 
-            pred_map = np.squeeze(post_process( preds[0], mask_threshold=.2, box_threshold=.5 )[0]) 
+            imgs, preds, _ = predict( [img], live_model=model ) 
+            pred_map = np.squeeze(post_process( preds[0], mask_threshold=.2, box_threshold=.75 )[0]) 
             print(f'computing pixel_metrics')
             pms.append( seglib.polygon_pixel_metrics_two_flat_maps( pred_map, gt_map ))
         print(seglib.mAP( pms ))
+
+        tps, fps, fns = zip(*[ seglib.polygon_pixel_metrics_to_line_based_scores_icdar_2017( pm )[:3] for pm in pms ])
+        print("ICDAR 2017")
+        print("F1: {}".format( 2.0 * (sum(tps) / (2*sum(tps)+sum(fps)+sum(fns)))))
+        print("Jaccard: {}".format(  (sum(tps) / (sum(tps)+sum(fps)+sum(fns)))))
+
+            
 
 
 
