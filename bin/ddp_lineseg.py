@@ -513,8 +513,8 @@ class LineDetectionDataset(Dataset):
             labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
             polygons = [ [ tuple(p) for p in l[self.polygon_type]] for l in segdict['lines'] ]
             masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
-            #bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
-            return img, {'masks': masks, 'labels': labels, 'path': img_path, 'orig_size': img.size }
+            bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
+            return img, {'masks': masks, 'boxes': bboxes, 'labels': labels, 'path': img_path, 'orig_size': img.size }
 
 ### Training 
 if __name__ == '__main__':
