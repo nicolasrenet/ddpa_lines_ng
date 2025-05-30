@@ -34,6 +34,8 @@ from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.models.detection.faster_rcnn import _default_anchorgen, RPNHead, FastRCNNConvFCHead
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import tormentor
+import math
 
 from tqdm.auto import tqdm
 
@@ -177,7 +179,7 @@ class RandomElasticGrid(v2.Transform):
 
 def post_process_two_maps( preds1: dict, preds2: dict, height: int, box_threshold=.9, mask_threshold=.25, orig_size=()):
     """
-    NOT FUNCTIONAL! Compute lines from predictions.
+    NOT FUNCTIONAL Compute lines from predictions.
 
     Args:
         preds1 (dict[str,torch.Tensor]): predicted dictionary for the top of the page:
@@ -245,7 +247,7 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.25, orig_size=(
     Returns:
         tuple[ np.ndarray, list[tuple[int, list, float, list]]]: a pair with
             - labeled map(1,H,W)
-            - a list of line attribute dicts (label, centroid pt, area, polygon coords.)
+            - a list of line attribute dicts (label, centroid pt, area, polygon coords, ...)
     """
     # select masks with best box scores
     best_masks = [ m.detach().numpy() for m in preds['masks'][preds['scores']>box_threshold]]
@@ -253,28 +255,56 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.25, orig_size=(
     masks = [ m * (m > mask_threshold) for m in best_masks ]
 
     # merge masks 
-    page_wide_mask = np.sum( masks, axis=0 ).astype('bool')
+    page_wide_mask_1hw = np.sum( masks, axis=0 ).astype('bool')
 
     # optional: scale up masks to the original size of the image
     if orig_size:
-        page_wide_mask = ski.transform.resize( page_wide_mask, (1, orig_size[1], orig_size[0]))
+        page_wide_mask_1hw = ski.transform.resize( page_wide_mask_1hw, (1, orig_size[1], orig_size[0]))
 
-    # label components
-    labeled_msk = ski.measure.label( page_wide_mask, connectivity=1 )
+    return get_morphology( page_wide_mask_1hw )
+
+def get_morphology( page_wide_mask_1hw: np.ndarray):
+    """
+    From a page-wide line mask, extract a labeled map and a dictionary of features.
     
-    # sort label from top to bottom (using centroids of labeled regions)
-    # note: labels are [1,H,W]. Accordingly, centroids are 3-tuples.
-    region_properties = ski.measure.regionprops( labeled_msk )
-    # last attribute is an estimate of the line height (Area/<major-axis length>)
-    attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords, reg.axis_major_length) for reg in region_properties ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
-    if [ att[0] for att in attributes ] != list(range(1, np.max(labeled_msk)+1)):
+    Args:
+        page_wide_mask_1hw (np.ndarray): a binary line mask (1,H,W)
+    Returns:
+        tuple[ np.ndarray, list[tuple[int, list, float, list]]]: a pair with
+            - labeled map(1,H,W)
+            - a list of line attribute dicts (label, centroid pt, area, polygon coords, ...)
+    """
+    # label components
+    labeled_msk_1hw = ski.measure.label( page_wide_mask_1hw, connectivity=1 )
+    
+    # sort label from top to bottom (using centroids of labeled regions) # note: labels are [1,H,W]. Accordingly, centroids are 3-tuples.
+    line_region_properties = ski.measure.regionprops( labeled_msk_1hw )
+    # list of line attribute tuples 
+    attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords, reg.axis_major_length) for reg in line_region_properties ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
+    
+    # compute line heights and center lines from skeletons
+    page_wide_skeleton_hw = ski.morphology.skeletonize( page_wide_mask_1hw[0] )
+    _, distance = ski.morphology.medial_axis( page_wide_mask_1hw[0], return_distance=True )
+    labeled_skl = ski.measure.label( page_wide_skeleton_hw, connectivity=2)
+    skeleton_coords = [ reg.coords for reg in ski.measure.regionprops( labeled_skl ) ]
+    line_heights = []
+    for lbl in range(1, np.max(labeled_skl)+1):
+        line_skeleton_dist = page_wide_skeleton_hw * ( labeled_skl == lbl ) * distance 
+        line_heights.append( (np.mean(line_skeleton_dist[ line_skeleton_dist != 0])*2).item() )
+    assert len(line_heights) == len( line_region_properties ) 
+
+    if [ att[0] for att in attributes ] != list(range(1, np.max(labeled_msk_1hw)+1)):
         print("Labels do not follow reading order")
-    return (labeled_msk, 
-            [ {'label': att[0], 
-            'centroid': att[1], 
-            'area': att[2], 
-            'coords': att[3], 
-            'axis_major_length': att[4]} for att in attributes ])
+
+    return (labeled_msk_1hw, [{
+                'label': att[0], 
+                'centroid': att[1], 
+                'area': att[2], 
+                'coords': att[3], 
+                #'axis_major_length': att[4],
+                'line_height': lh, 
+                'centerline': skc,
+            } for att,lh,skc in zip(attributes, line_heights, skeleton_coords) ])
 
 
 def split_set( *arrays, test_size=.2, random_state=46):
@@ -402,7 +432,12 @@ class SegModel():
             return model
         return SegModel(**kwargs)
 
-class ChartersDataset(Dataset):
+
+
+
+
+
+class LineDetectionDataset(Dataset):
     """
     This class represents a PyTorch Dataset for a collection of images and their annotations.
     The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
@@ -453,25 +488,9 @@ class ChartersDataset(Dataset):
         # Load the image and its target (segmentation masks, bounding boxes and labels)
         image, target = self._load_image_and_target(img_path, label_path)
         
-        # Apply the transformations, if any
+        # Apply basic transformations (img -> tensor, resizing, scaling)
         if self._transforms:
             image, target = self._transforms(image, target)
-        
-        #plt.imshow( torch.sum(target['masks'], axis=0))
-        #plt.savefig('last_mask.pdf')
-        #plt.show()
-
-        # first, filter empty masks
-        keep = torch.sum( target['masks'], dim=(1,2)) > 10
-        target['masks']=target['masks'][keep]
-        target['labels']=target['labels'][keep]
-
-        boxes=BoundingBoxes(data=torchvision.ops.masks_to_boxes(target['masks']), format='xyxy', canvas_size=image.shape)
-        # then, filter invalid boxes, and masks and labels, once more
-        keep=(boxes[:,0]-boxes[:,2])*(boxes[:,1]-boxes[:,3]) != 0 
-        target['boxes']=boxes[keep]
-        target['masks']=target['masks'][keep]
-        target['labels']=target['labels'][keep].to(dtype=torch.int64)
 
         return image, target
 
@@ -487,19 +506,14 @@ class ChartersDataset(Dataset):
             tuple: A tuple containing the image and a dictionary with 'boxes' and 'labels' keys.
         """
         # Open the image file and convert it to RGB
-        img = Image.open(img_path).convert('RGB')
+        img = Image.open(img_path)#.convert('RGB')
 
         with open( annotation_path, 'r') as annotation_if:
             segdict = json.load( annotation_if )
             labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
-            #print(type(labels), labels.dtype)
             polygons = [ [ tuple(p) for p in l[self.polygon_type]] for l in segdict['lines'] ]
-            # Convert polygons to mask images
             masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
-            #print("masks before transforms:", type(masks), masks.shape)
-            # Generate bounding box annotations from segmentation masks
             #bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
-            #return img, {'masks': masks,'boxes': bboxes, 'labels': labels, 'path': img_path}
             return img, {'masks': masks, 'labels': labels, 'path': img_path, 'orig_size': img.size }
 
 ### Training 
@@ -542,26 +556,57 @@ if __name__ == '__main__':
     imgs_train, imgs_test, lbls_train, lbls_test = split_set( imgs, lbls )
     imgs_train, imgs_val, lbls_train, lbls_val = split_set( imgs_train, lbls_train )
 
-    train_transforms = v2.Compose([
-            v2.ToImage(),
-            v2.Resize( hyper_params['img_size'] ),
-            RandomElasticGrid(p=0.3, grid_cols=(4,20)),
-            v2.RandomRotation( 5 ),
-            v2.RandomHorizontalFlip(p=.2),
-            #v2.SanitizeBoundingBoxes(),
-            v2.ToDtype(torch.float32, scale=True),
-            ])
-    validate_transforms = v2.Compose([
+#    train_transforms = v2.Compose([
+#            v2.ToImage(),
+#            v2.Resize( hyper_params['img_size'] ),
+#            RandomElasticGrid(p=0.3, grid_cols=(4,20)),
+#            v2.RandomRotation( 5 ),
+#            v2.RandomHorizontalFlip(p=.2),
+#            #v2.SanitizeBoundingBoxes(),
+#            v2.ToDtype(torch.float32, scale=True),
+#            ])
+    basic_transforms = v2.Compose([
             v2.ToImage(),
             v2.Resize( hyper_params['img_size'] ),
             v2.ToDtype(torch.float32, scale=True), ])
 
-    ds_train = ChartersDataset( imgs_train, lbls_train, transforms=train_transforms)
-    ds_val = ChartersDataset( imgs_val, lbls_val, transforms=validate_transforms)
-    ds_test = ChartersDataset( imgs_test, lbls_test, transforms=validate_transforms)
+    ds_train = LineDetectionDataset( imgs_train, lbls_train, transforms=basic_transforms)
+    ds_val = LineDetectionDataset( imgs_val, lbls_val, transforms=basic_transforms)
+    ds_test = LineDetectionDataset( imgs_test, lbls_test, transforms=basic_transforms)
+
+    ######################################
+    # Tormentor augmentations
+    def augment_with_bboxes( sample, aug, device ):
+        """ Augment a sample (img + masks), and add bounding boxes to the target
+
+        Args:
+            sample (Tuple[Tensor,dict]): tuple with image (as tensor) and label dictionary.
+        """
+        img, target = sample
+        img = img.to(device)
+        img = aug(img)
+        masks, labels = target['masks'].to(device), target['labels'].to(device)
+        # careful: when passing line masks as (L,H,W), Tormentor assumes that L indexes a batch,
+        # causing the transform to be called with different parameters for each line mask. Solution:
+        # augment each mask separately 
+        #masks = aug(target['masks']).to(device)
+        masks = torch.stack( [ aug(m, is_mask=True) for m in target['masks'] ], axis=0).to(device)
+        # first, filter empty masks
+        keep = torch.sum( masks, dim=(1,2)) > 10
+        masks, labels = masks[keep], labels[keep]
+        # construct boxes, filter out invalid ones
+        boxes=BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.shape)
+        keep=(boxes[:,0]-boxes[:,2])*(boxes[:,1]-boxes[:,3]) != 0
+
+        target['boxes'], target['labels'], target['masks'] = boxes[keep], labels[keep], masks[keep]
+        return (img, target)
+
+    augRotate = tormentor.Rotate.override_distributions(radians=tormentor.Uniform((-math.pi/8, math.pi/8)))
+    aug = tormentor.AugmentationChoice.create( [ tormentor.Wrap, augRotate, tormentor.Perspective ] )
+    ds_train = tormentor.AugmentedDs( ds_train, tormentor.aug, computation_device='cuda', augment_sample_function=augment_with_bboxes )
+    #################################
 
     dl_train = DataLoader( ds_train, batch_size=hyper_params['batch_size'], shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
-    rpn_anchor_generator = _default_anchorgen()
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
 
     # update learning parameters from past epochs
@@ -612,9 +657,9 @@ if __name__ == '__main__':
         epoch_losses = []
         batches = iter(dl_train)
         
-        for batch_index, sample in enumerate(pbar := tqdm(dl_train)):
+        for batch_index, batch in enumerate(pbar := tqdm(dl_train)):
             pbar.set_description(f'Epoch {epoch}')
-            imgs, targets = sample
+            imgs, targets = batch
             imgs = torch.stack(imgs).cuda()
             targets = [ { k:t[k].cuda() for k in ('labels', 'boxes', 'masks') } for t in targets ]
             loss_dict = model.net(imgs, targets)

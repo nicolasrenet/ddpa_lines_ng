@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 p = {
         "appname": "lines",
-        "model_path": str(src_root.joinpath("models/blla.mlmodel")),
+        "model_path": str(src_root.joinpath("best.mlmodel")),
         #"img_paths": set([Path.home().joinpath("tmp/data/1000CV/AT-AES/d3a416ef7813f88859c305fb83b20b5b/207cd526e08396b4255b12fa19e8e4f8/4844ee9f686008891a44821c6133694d.img.jpg")]),
         "img_paths": set([]),
         "charter_dirs": set(["./"]),
@@ -79,11 +79,16 @@ def build_segdict( img, segmentation_record, contour_tolerance=4.0 ):
     segdict = {'lines':[] }
     mp, atts = segmentation_record
     for att_dict in atts:
-        label, polygon_coords, area, axis_major_length = [ att_dict[k] for k in ('label','coords','area','axis_major_length')]
+        label, polygon_coords, area, line_height, centerline = [ att_dict[k] for k in ('label','coords','area', 'line_height', 'centerline')]
         #if label==1:
         #    print(polygon_coords[:,1:], "shape=", polygon_coords[:,1:].shape)
-        segdict['lines'].append({ 'id': label, 'boundary': ski.measure.approximate_polygon( polygon_coords[:,1:], tolerance=contour_tolerance).tolist()})
-    #print(segdict)
+        segdict['lines'].append({ 
+                'id': label, 
+                'boundary': ski.measure.approximate_polygon( polygon_coords[:,1:], tolerance=contour_tolerance).tolist(),
+                'stroke_width': line_height,
+                'centerline': ski.measure.approximate_polygon( centerline, tolerance=contour_tolerance).tolist(),
+                })
+    print(segdict)
     return segdict
 
 

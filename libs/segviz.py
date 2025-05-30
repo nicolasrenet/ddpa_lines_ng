@@ -63,8 +63,9 @@ def batch_visuals( inputs:list[Union[Tensor,dict,Path]], raw_maps: list[tuple[np
             - dictionaries with 'img' tensor
             - image paths
         raw_maps (list[tuple[np.ndarray,dict]]): a list of tuples with
-            - labeled map 
-            - attributes: i.e. dictionary of the form `{'masks': ..., 'boxes': ..., 'scores': ... }`
+            - labeled map (1,H,W)
+            - attributes: i.e. dictionary of morphological attributes (simply passed through, for use 
+              by a consumer, plotting function)
     Returns:
         list[tuple[np.array, dict, str]]: a list of tuples (img_HWC, attributes, id)
     """
