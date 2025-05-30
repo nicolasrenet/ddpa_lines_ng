@@ -602,7 +602,8 @@ if __name__ == '__main__':
         return (img, target)
 
     augRotate = tormentor.Rotate.override_distributions(radians=tormentor.Uniform((-math.pi/8, math.pi/8)))
-    aug = tormentor.AugmentationChoice.create( [ tormentor.Wrap, augRotate, tormentor.Perspective ] )
+    # first augmentation in the list is a pass-through
+    aug = tormentor.AugmentationChoice.create( [ tormentor.StaticImageAugmentation, tormentor.Wrap, augRotate, tormentor.Perspective ] )
     ds_train = tormentor.AugmentedDs( ds_train, tormentor.aug, computation_device='cuda', augment_sample_function=augment_with_bboxes )
     #################################
 
