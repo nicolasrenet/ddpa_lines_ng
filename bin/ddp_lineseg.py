@@ -549,7 +549,7 @@ if __name__ == '__main__':
     model.hyper_parameters = hyper_params
 
     random.seed(46)
-    imgs = random.sample( args.img_paths, hyper_params['train_set_limit']) if hyper_params['train_set_limit'] else list(args.img_paths)
+    imgs = random.sample( list(args.img_paths), hyper_params['train_set_limit']) if hyper_params['train_set_limit'] else list(args.img_paths)
     lbls = [ str(img_path).replace('.img.jpg', args.line_segmentation_suffix) for img_path in imgs ]
 
     # split sets
