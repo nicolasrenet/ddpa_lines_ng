@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 
+Line segmentation app: model training, prediction, evaluation.
+
 
 TODO:
 
@@ -10,18 +12,27 @@ TODO:
 
 """
 
+# stdlib
 import sys
 import json
 from pathlib import Path
 from typing import Union, Any
 import random
+import math
+import logging
+
+# 3rd party
+from PIL import Image
+import skimage as ski
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 from torch import nn 
 from torch.utils.tensorboard import SummaryWriter
-
 import torchvision
 import torchvision.transforms.v2 as v2
 import torchvision.tv_tensors as tvt
@@ -34,21 +45,20 @@ from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.models.detection.faster_rcnn import _default_anchorgen, RPNHead, FastRCNNConvFCHead
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-import tormentor
-import math
 
-from tqdm.auto import tqdm
-
-from PIL import Image
-import skimage as ski
-import numpy as np
-import matplotlib.pyplot as plt
-
+# DiDip
 import fargv
+import tormentor
 
-sys.path.append('.')
 
+# local
+sys.path.append( str(Path(__file__).parents[1] ))
 from libs import segviz, seglib
+
+
+logging.basicConfig( level=logging.DEBUG, format="%(asctime)s - %(levelname)s: %(funcName)s - %(message)s", force=True )
+logger = logging.getLogger(__name__)
+#logger.propagate=False
 
 p = {
     'max_epoch': 250,
@@ -78,108 +88,119 @@ p = {
 random.seed(46)
 
 
-def grid_wave_t( img: Union[np.ndarray,Tensor], grid_cols=(4,20,),random_state=46):
+
+class LineDetectionDataset(Dataset):
     """
-    Makeshift grid-based transform (to be put into a v2.transform). Randomness potentially affects the output
-    in 3 ways:
-    - range of the sinusoidal function used to move the ys
-    - number of columns in the grid
-    - amount of the y-offset across xs
+    PyTorch Dataset for a collection of images and their annotations.
+    A sample comprises:
+
+    + image
+    + target dictionary: LHW segmentation mask tensor (1 mask for each of the L lines), L4 bounding box tensor, L label tensor.
+    """
+    def __init__(self, img_paths, label_paths, polygon_type='coreBoundary', transforms=None, img_size=(1024,1024)):
+        """
+        Constructor for the Dataset class.
+
+        Parameters:
+            img_paths (list): List of unique identifiers for images.
+            label_paths (list): List of label paths.
+            transforms (callable, optional): Optional transform to be applied on a sample.
+        """
+        super(Dataset, self).__init__()
+        
+        self._img_paths = img_paths  # List of image keys
+        self._label_paths = label_paths  # List of image annotation files
+        self.polygon_type = polygon_type
+        self._transforms = transforms if transforms is not None else v2.Compose([
+            v2.ToImage(),
+            v2.Resize( img_size ),
+            v2.ToDtype(torch.float32, scale=True),])
+
+        
+    def __len__(self):
+        """
+        Returns the length of the dataset.
+
+        Returns:
+            int: The number of items in the dataset.
+        """
+        return len(self._img_paths)
+        
+    def __getitem__(self, index):
+        """
+        Fetch an item from the dataset at the specified index.
+
+        Args:
+            index (int): Index of the item to fetch from the dataset.
+
+        Returns:
+            tuple: A tuple containing the image and its associated target (annotations).
+        """
+        # Retrieve the key for the image at the specified index
+        img_path, label_path = self._img_paths[index], self._label_paths[index]
+        # Get the annotations for this image
+        label_path = Path(str(img_path).replace('.img.jpg','.lines.gt.json'))
+        # Load the image and its target (segmentation masks, bounding boxes and labels)
+        image, target = self._load_image_and_target(img_path, label_path)
+        
+        # Apply basic transformations (img -> tensor, resizing, scaling)
+        if self._transforms:
+            image, target = self._transforms(image, target)
+
+        return image, target
+
+    def _load_image_and_target(self, img_path, annotation_path):
+        """
+        Load an image and its target (bounding boxes and labels).
+
+        Parameters:
+            img_path (Path): image path
+            annotation_path (Path): annotation path
+
+        Returns:
+            tuple: A tuple containing the image and a dictionary with 'masks', 'boxes' and 'labels' keys.
+        """
+        # Open the image file and convert it to RGB
+        img = Image.open(img_path)#.convert('RGB')
+
+        with open( annotation_path, 'r') as annotation_if:
+            segdict = json.load( annotation_if )
+            labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
+            polygons = [ [ tuple(p) for p in l[self.polygon_type]] for l in segdict['lines'] ]
+            masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
+            bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
+            return img, {'masks': masks, 'boxes': bboxes, 'labels': labels, 'path': img_path, 'orig_size': img.size }
+
+
+def augment_with_bboxes( sample, aug, device ):
+    """  Augment a sample (img + masks), and add bounding boxes to the target.
+    (For Tormentor only).
 
     Args:
-        img (Union[Tensor,np.ndarray]): input image, as tensor, or numpy array. For the former,
-            assume CHW for input, with output the same. For the latter, both input and output 
-            are HWC.
-        grid_cols (tuple[int]): number of cols for this grid is randomly picked from this tuple.
-
-    Return:
-        Union[Tensor,np.ndarray]: tensor or np.ndarray with same size.
+        sample (Tuple[Tensor,dict]): tuple with image (as tensor) and label dictionary.
     """
-    #print("In:", img.shape, type(img), img.dtype)
-    # if input is a Tensor, assume CHW and reshape to HWC
-    if isinstance(img, Tensor):
-        img_t = img.permute(1,2,0) 
-        if type(img) is tvt.Image:
-            img = tvt.wrap( img_t, like=img)
-        else:
-            img = img_t
-    np.random.seed( random_state ) 
-    parallel = np.random.choice([True, False])
-    rows, cols = img.shape[0], img.shape[1]
+    img, target = sample
+    img = img.to(device)
+    img = aug(img)
+    masks, labels = target['masks'].to(device), target['labels'].to(device)
+    # careful: when passing line masks as (L,H,W), Tormentor assumes that L indexes a batch,
+    # causing the transform to be called with different parameters for each line mask. Solution:
+    # augment each mask separately 
+    masks = torch.stack( [ aug(m, is_mask=True) for m in target['masks'] ], axis=0).to(device)
+    # first, filter empty masks
+    keep = torch.sum( masks, dim=(1,2)) > 10
+    masks, labels = masks[keep], labels[keep]
+    # construct boxes, filter out invalid ones
+    boxes=BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.shape)
+    keep=(boxes[:,0]-boxes[:,2])*(boxes[:,1]-boxes[:,3]) != 0
 
-    col_count = np.random.choice(grid_cols)
-    #print("grid_wave_t( grid_cols={}, random_state={}, parallel={}, col_count={})".format( grid_cols, random_state, parallel, col_count))
-    src_cols = np.linspace(0, cols, col_count)  # simulate folds (increase the number of columns
-                                        # for smoother curves
-    src_rows = np.linspace(0, rows, 10)
-    src_rows, src_cols = np.meshgrid(src_rows, src_cols)
-    src = np.dstack([src_cols.flat, src_rows.flat])[0]
-
-    # add sinusoidal oscillation to row coordinates
-    offset = float(img.shape[0]/20)
-    column_offset = np.random.choice([5,10,20,30], size=src.shape[0]) if (not parallel and col_count <=5) else offset
-    dst_rows = src[:, 1] - np.sin(np.linspace(0, np.random.randint(1,13)/4 * np.pi, src.shape[0])) * column_offset
-    dst_cols = src[:, 0]
-    
-    ratio = 1.0 # resulting image is {ratio} bigger that its warped manuscript part 
-              # if ratio=1, manuscript is likely to be cropped
-    dst_rows = ratio*( dst_rows - offset)
-    dst = np.vstack([dst_cols, dst_rows]).T
-    tform = ski.transform.PiecewiseAffineTransform()
-    tform.estimate(src, dst)
-    out_rows = img.shape[0] #- int(ratio * offset)
-    out_cols = cols
-    out = ski.transform.warp(img, tform, output_shape=(out_rows, out_cols))
-    #print("Out of warp():", type(img), "->", type(out), out.dtype, out.shape)
-    # keep type, but HWC -> CHW
-    if isinstance(img, Tensor):
-        out = torch.from_numpy(out).permute(2,0,1)
-        if type(img) is tvt.Image:
-            out= tvt.wrap( out, like=img)
-    #print("Return:", type(out), out.dtype, out.shape)
-    return out
-
-
-
-class RandomElasticGrid(v2.Transform):
-    """
-    Deform the image over an elastic grid (v2-compatible)
-    """
-
-    def __init__(self, **kwargs):
-        """
-        Args:
-            p (float): prob. for applying the transform.
-            grid_cols (tuple[int]): number of columns in the grid from which to pick from (the larger, the smoother the deformation)
-                Ex. with (4,20,), the wrapped function randomly picks 4 or 20 columns
-        """
-        self.params = dict(kwargs)
-        self.p = self.params['p']
-        # allow to re-seed the wrapped function for each call
-        super().__init__()
-
-    def make_params(self, flat_inputs: list[Any]):
-        """ Called after initialization """
-        apply = (torch.rand(size=(1,)) < self.p).item()
-        # s.t. each of the subsequent calls to the wrapped function (on the flattened list of data structures
-        # in the sample) uses the _same_ random seeed (but a different one for each batch).
-        self.params.update(dict(apply=apply, random_state=random.randint(1,100))) # passed to transform()
-        return self.params
-
-    def transform(self, inpt: Any, params: dict['str', Any]):
-        if not params['apply']:
-            #print('no transform', type(inpt), inpt.dtype)
-            return inpt
-        if isinstance(inpt, BoundingBoxes):
-            return inpt
-        return grid_wave_t( inpt, grid_cols=params['grid_cols'], random_state=params['random_state'])
-
-
+    target['boxes'], target['labels'], target['masks'] = boxes[keep], labels[keep], masks[keep]
+    return (img, target)
 
 
 def post_process_two_maps( preds1: dict, preds2: dict, height: int, box_threshold=.9, mask_threshold=.25, orig_size=()):
     """
-    NOT FUNCTIONAL Compute lines from predictions.
+    NOT FUNCTIONAL Compute lines out of two prediction sets.
 
     Args:
         preds1 (dict[str,torch.Tensor]): predicted dictionary for the top of the page:
@@ -253,10 +274,8 @@ def post_process( preds: dict, box_threshold=.9, mask_threshold=.25, orig_size=(
     best_masks = [ m.detach().numpy() for m in preds['masks'][preds['scores']>box_threshold]]
     # threshold masks
     masks = [ m * (m > mask_threshold) for m in best_masks ]
-
     # merge masks 
     page_wide_mask_1hw = np.sum( masks, axis=0 ).astype('bool')
-
     # optional: scale up masks to the original size of the image
     if orig_size:
         page_wide_mask_1hw = ski.transform.resize( page_wide_mask_1hw, (1, orig_size[1], orig_size[0]))
@@ -275,36 +294,42 @@ def get_morphology( page_wide_mask_1hw: np.ndarray):
             - a list of line attribute dicts (label, centroid pt, area, polygon coords, ...)
     """
     # label components
-    labeled_msk_1hw = ski.measure.label( page_wide_mask_1hw, connectivity=1 )
-    
+    labeled_msk_1hw = ski.measure.label( page_wide_mask_1hw, connectivity=2 )
+    logger.debug("Found {} connected components on 1HW binary map.".format( np.max( labeled_msk_1hw )))
     # sort label from top to bottom (using centroids of labeled regions) # note: labels are [1,H,W]. Accordingly, centroids are 3-tuples.
     line_region_properties = ski.measure.regionprops( labeled_msk_1hw )
+    logger.debug("Extracted {} region property records from labeled map.".format( len( line_region_properties )))
     # list of line attribute tuples 
-    attributes = sorted([ (reg.label, reg.centroid, reg.area, reg.coords, reg.axis_major_length) for reg in line_region_properties ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
+    attributes = sorted([ (reg.label, reg.centroid, reg.area ) for reg in line_region_properties ], key=lambda attributes: (attributes[1][1], attributes[1][2]))
     
     # compute line heights and center lines from skeletons
     page_wide_skeleton_hw = ski.morphology.skeletonize( page_wide_mask_1hw[0] )
     _, distance = ski.morphology.medial_axis( page_wide_mask_1hw[0], return_distance=True )
     labeled_skl = ski.measure.label( page_wide_skeleton_hw, connectivity=2)
+    logger.debug("Computed {} skeletons on 1HW binary map.".format( np.max( labeled_skl )))
     skeleton_coords = [ reg.coords for reg in ski.measure.regionprops( labeled_skl ) ]
-    line_heights = []
+    line_heights, polygon_coords = [], []
+    logger.debug("Computing line heights...")
     for lbl in range(1, np.max(labeled_skl)+1):
         line_skeleton_dist = page_wide_skeleton_hw * ( labeled_skl == lbl ) * distance 
+        logger.debug("- labeled skeleton {} of length {}".format(lbl, np.sum(line_skeleton_dist != 0) ))
         line_heights.append( (np.mean(line_skeleton_dist[ line_skeleton_dist != 0])*2).item() )
+        polygon_coords.append( ski.measure.find_contours( labeled_msk_1hw[0] == lbl )[0].astype('int'))
     assert len(line_heights) == len( line_region_properties ) 
 
+    # CCs top-to-bottom ordering differ from BBs centroid ordering: usually hints
+    # at messy, non-standard line layout
     if [ att[0] for att in attributes ] != list(range(1, np.max(labeled_msk_1hw)+1)):
-        print("Labels do not follow reading order")
+        logger.warning("Labels do not follow reading order")
 
     return (labeled_msk_1hw, [{
                 'label': att[0], 
                 'centroid': att[1], 
                 'area': att[2], 
-                'coords': att[3], 
-                #'axis_major_length': att[4],
+                'polygon_coords': plgc,
                 'line_height': lh, 
                 'centerline': skc,
-            } for att,lh,skc in zip(attributes, line_heights, skeleton_coords) ])
+            } for att, lh, skc, plgc in zip(attributes, line_heights, skeleton_coords, polygon_coords) ])
 
 
 def split_set( *arrays, test_size=.2, random_state=46):
@@ -316,6 +341,8 @@ def split_set( *arrays, test_size=.2, random_state=46):
     for a in arrays:
         sets.extend( [[ a[i] for i in train_set ], [ a[j] for j in test_set ]] )
     return sets
+
+
 
 def build_nn( backbone='resnet101'):
 
@@ -434,89 +461,7 @@ class SegModel():
 
 
 
-
-
-
-class LineDetectionDataset(Dataset):
-    """
-    This class represents a PyTorch Dataset for a collection of images and their annotations.
-    The class is designed to load images along with their corresponding segmentation masks, bounding box annotations, and labels.
-    """
-    def __init__(self, img_paths, label_paths, polygon_type='coreBoundary', transforms=None, default_img_size=1024):
-        """
-        Constructor for the Dataset class.
-
-        Parameters:
-            img_paths (list): List of unique identifiers for images.
-            label_paths (list): List of label paths.
-            transforms (callable, optional): Optional transform to be applied on a sample.
-        """
-        super(Dataset, self).__init__()
-        
-        self._img_paths = img_paths  # List of image keys
-        self._label_paths = label_paths  # List of image annotation files
-        self.polygon_type = polygon_type
-        self._transforms = transforms if transforms is not None else v2.Compose([
-            v2.ToImage(),
-            v2.Resize([ default_img_size, default_img_size ]),
-            v2.ToDtype(torch.float32, scale=True),])
-
-        
-    def __len__(self):
-        """
-        Returns the length of the dataset.
-
-        Returns:
-            int: The number of items in the dataset.
-        """
-        return len(self._img_paths)
-        
-    def __getitem__(self, index):
-        """
-        Fetch an item from the dataset at the specified index.
-
-        Args:
-            index (int): Index of the item to fetch from the dataset.
-
-        Returns:
-            tuple: A tuple containing the image and its associated target (annotations).
-        """
-        # Retrieve the key for the image at the specified index
-        img_path, label_path = self._img_paths[index], self._label_paths[index]
-        # Get the annotations for this image
-        label_path = Path(str(img_path).replace('.img.jpg','.lines.gt.json'))
-        # Load the image and its target (segmentation masks, bounding boxes and labels)
-        image, target = self._load_image_and_target(img_path, label_path)
-        
-        # Apply basic transformations (img -> tensor, resizing, scaling)
-        if self._transforms:
-            image, target = self._transforms(image, target)
-
-        return image, target
-
-    def _load_image_and_target(self, img_path, annotation_path):
-        """
-        Load an image and its target (bounding boxes and labels).
-
-        Parameters:
-            img_path (Path): image path
-            annotation_path (Path): annotation path
-
-        Returns:
-            tuple: A tuple containing the image and a dictionary with 'boxes' and 'labels' keys.
-        """
-        # Open the image file and convert it to RGB
-        img = Image.open(img_path)#.convert('RGB')
-
-        with open( annotation_path, 'r') as annotation_if:
-            segdict = json.load( annotation_if )
-            labels = torch.tensor( [ 1 ]*len(segdict['lines']), dtype=torch.int64)
-            polygons = [ [ tuple(p) for p in l[self.polygon_type]] for l in segdict['lines'] ]
-            masks = Mask(torch.stack([ Mask( ski.draw.polygon2mask( img.size, polyg )).permute(1,0) for polyg in polygons ]))
-            bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.size[::-1])
-            return img, {'masks': masks, 'boxes': bboxes, 'labels': labels, 'path': img_path, 'orig_size': img.size }
-
-### Training 
+# TRAINING AND VALIDATION SCRIPT
 if __name__ == '__main__':
 
     args, _ = fargv.fargv( p )
@@ -534,11 +479,11 @@ if __name__ == '__main__':
     model = SegModel( args.backbone )
     # loading weights only
     if args.weight_file is not None and Path(args.weight_file).exists():
-        print('Loading weights from {}'.format( args.weight_file))
+        logger.info('Loading weights from {}'.format( args.weight_file))
         model.net.load_state_dict( torch.load(args.weight_file, weights_only=True))
     # resuming from dictionary
     elif args.resume_file is not None and Path(args.resume_file).exists():
-        print('Loading model parameters from resume file {}'.format(args.resume_file))
+        logger.info('Loading model parameters from resume file {}'.format(args.resume_file))
         model = SegModel.resume( args.resume_file ) # reload hyper-parameters from there
         hyper_params.update( model.hyper_parameters )
     # TODO: partial overriding of param dictionary 
@@ -556,56 +501,16 @@ if __name__ == '__main__':
     imgs_train, imgs_test, lbls_train, lbls_test = split_set( imgs, lbls )
     imgs_train, imgs_val, lbls_train, lbls_val = split_set( imgs_train, lbls_train )
 
-#    train_transforms = v2.Compose([
-#            v2.ToImage(),
-#            v2.Resize( hyper_params['img_size'] ),
-#            RandomElasticGrid(p=0.3, grid_cols=(4,20)),
-#            v2.RandomRotation( 5 ),
-#            v2.RandomHorizontalFlip(p=.2),
-#            #v2.SanitizeBoundingBoxes(),
-#            v2.ToDtype(torch.float32, scale=True),
-#            ])
-    basic_transforms = v2.Compose([
-            v2.ToImage(),
-            v2.Resize( hyper_params['img_size'] ),
-            v2.ToDtype(torch.float32, scale=True), ])
+    ds_train = LineDetectionDataset( imgs_train, lbls_train, img_size=hyper_params['img_size'] )
+    ds_val = LineDetectionDataset( imgs_val, lbls_val, img_size=hyper_params['img_size'] )
+    ds_test = LineDetectionDataset( imgs_test, lbls_test, img_size=hyper_params['img_size'] )
 
-    ds_train = LineDetectionDataset( imgs_train, lbls_train, transforms=basic_transforms)
-    ds_val = LineDetectionDataset( imgs_val, lbls_val, transforms=basic_transforms)
-    ds_test = LineDetectionDataset( imgs_test, lbls_test, transforms=basic_transforms)
 
-    ######################################
-    # Tormentor augmentations
-    def augment_with_bboxes( sample, aug, device ):
-        """ Augment a sample (img + masks), and add bounding boxes to the target
-
-        Args:
-            sample (Tuple[Tensor,dict]): tuple with image (as tensor) and label dictionary.
-        """
-        img, target = sample
-        img = img.to(device)
-        img = aug(img)
-        masks, labels = target['masks'].to(device), target['labels'].to(device)
-        # careful: when passing line masks as (L,H,W), Tormentor assumes that L indexes a batch,
-        # causing the transform to be called with different parameters for each line mask. Solution:
-        # augment each mask separately 
-        #masks = aug(target['masks']).to(device)
-        masks = torch.stack( [ aug(m, is_mask=True) for m in target['masks'] ], axis=0).to(device)
-        # first, filter empty masks
-        keep = torch.sum( masks, dim=(1,2)) > 10
-        masks, labels = masks[keep], labels[keep]
-        # construct boxes, filter out invalid ones
-        boxes=BoundingBoxes(data=torchvision.ops.masks_to_boxes(masks), format='xyxy', canvas_size=img.shape)
-        keep=(boxes[:,0]-boxes[:,2])*(boxes[:,1]-boxes[:,3]) != 0
-
-        target['boxes'], target['labels'], target['masks'] = boxes[keep], labels[keep], masks[keep]
-        return (img, target)
-
-    augRotate = tormentor.Rotate.override_distributions(radians=tormentor.Uniform((-math.pi/8, math.pi/8)))
+    augRotate = tormentor.Rotate.override_distributions(radians=tormentor.Uniform((-math.radians(15), math.radians(15))))
     # first augmentation in the list is a pass-through
-    aug = tormentor.AugmentationChoice.create( [ tormentor.StaticImageAugmentation, tormentor.Wrap, augRotate, tormentor.Perspective ] )
-    ds_train = tormentor.AugmentedDs( ds_train, tormentor.aug, computation_device='cuda', augment_sample_function=augment_with_bboxes )
-    #################################
+    augChoice = tormentor.AugmentationChoice.create( [ tormentor.StaticImageAugmentation, tormentor.Wrap, augRotate, tormentor.Perspective ] )
+    augChoice = augChoice.override_distributions(choice=tormentor.Categorical(probs=(.6,.15,.15,.1)))
+    ds_train = tormentor.AugmentedDs( ds_train, tormentor.augChoice, computation_device='cuda', augment_sample_function=augment_with_bboxes )
 
     dl_train = DataLoader( ds_train, batch_size=hyper_params['batch_size'], shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
@@ -616,8 +521,8 @@ if __name__ == '__main__':
         best_epoch,  best_loss = min([ (i, ep['validation_loss']) for i,ep in enumerate(model.epochs) ], key=lambda t: t[1])
         if 'lr' in model.epochs[-1]:
             lr = model.epochs[-1]['lr']
-            print("Read start lR from last stored epoch: {}".format(lr))
-    print(f"Best validation loss ({best_loss}) at epoch {best_epoch}")
+            logger.info("Read start lR from last stored epoch: {}".format(lr))
+    logger.info(f"Best validation loss ({best_loss}) at epoch {best_epoch}")
 
     optimizer = torch.optim.AdamW( model.net.parameters(), lr=lr )
     scheduler = ReduceLROnPlateau( optimizer, patience=hyper_params['scheduler_patience'], factor=hyper_params['scheduler_factor'] )
@@ -637,8 +542,8 @@ if __name__ == '__main__':
             validation_losses.append( loss.detach())
             loss_box_reg.append( loss_dict['loss_box_reg'].detach())
             loss_mask.append( loss_dict['loss_mask'].detach())
-        print( "Loss boxes: {}".format( torch.stack(loss_box_reg).mean().item()))
-        print( "Loss masks: {}".format( torch.stack(loss_mask).mean().item()))
+        logger.info( "Loss boxes: {}".format( torch.stack(loss_box_reg).mean().item()))
+        logger.info( "Loss masks: {}".format( torch.stack(loss_mask).mean().item()))
         return torch.stack( validation_losses ).mean().item()    
         
     def update_tensorboard(writer, epoch, training_loss, validation_loss):
@@ -686,7 +591,7 @@ if __name__ == '__main__':
 
         epoch_start = len( model.epochs )
         if epoch_start > 0:
-            print(f"Resuming training at epoch {epoch_start}.")
+            logger.info(f"Resuming training at epoch {epoch_start}.")
 
         for epoch in range( epoch_start, 0 if args.dry_run else hyper_params['max_epoch'] ):
 
@@ -706,19 +611,19 @@ if __name__ == '__main__':
             model.save('last.mlmodel')
 
             if mean_validation_loss < best_loss:
-                print("Mean validation loss ({}) < best loss ({}): updating best model.".format(mean_validation_loss, best_loss))
+                logger.info("Mean validation loss ({}) < best loss ({}): updating best model.".format(mean_validation_loss, best_loss))
                 best_loss = mean_validation_loss
                 best_epoch = epoch
                 torch.save( model.net.state_dict(), 'best.pt')
                 model.save( 'best.mlmodel' )
-            print('Training loss: {:.4f} (lr={}) - Validation loss: {:.4f} - Best epoch: {} (loss={:.4f})'.format(
+            logger.info('Training loss: {:.4f} (lr={}) - Validation loss: {:.4f} - Best epoch: {} (loss={:.4f})'.format(
                 mean_training_loss, 
                 scheduler.get_last_lr()[0],
                 mean_validation_loss, 
                 best_epoch,
                 best_loss,))
             if epoch - best_epoch > hyper_params['patience']:
-                print("No improvement since epoch {}: early exit.".format(best_epoch))
+                logger.info("No improvement since epoch {}: early exit.".format(best_epoch))
                 break
 
         writer.flush()
@@ -735,12 +640,12 @@ if __name__ == '__main__':
         pms = []
         for i,sample in enumerate(list(ds_val)[:args.validation_set_limit] if args.validation_set_limit else ds_val):
             img, target = sample
-            print(f'{i}: computing gt_map...', end='')
+            logger.debug(f'{i}: computing gt_map...', end='')
             gt_map = segviz.gt_masks_to_labeled_map( target['masks'] )
-            print(f'computing pred_map...', end='')
+            logger.debug(f'computing pred_map...', end='')
             imgs, preds, _ = predict( [img], live_model=model ) 
             pred_map = np.squeeze(post_process( preds[0], mask_threshold=.2, box_threshold=.75 )[0]) 
-            print(f'computing pixel_metrics')
+            logger.debug(f'computing pixel_metrics')
             pms.append( seglib.polygon_pixel_metrics_two_flat_maps( pred_map, gt_map ))
         print(seglib.mAP( pms ))
 
