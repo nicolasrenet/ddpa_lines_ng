@@ -510,7 +510,7 @@ if __name__ == '__main__':
     # first augmentation in the list is a pass-through
     augChoice = tormentor.AugmentationChoice.create( [ tormentor.StaticImageAugmentation, tormentor.Wrap, augRotate, tormentor.Perspective ] )
     augChoice = augChoice.override_distributions(choice=tormentor.Categorical(probs=(.6,.15,.15,.1)))
-    ds_train = tormentor.AugmentedDs( ds_train, tormentor.augChoice, computation_device='cuda', augment_sample_function=augment_with_bboxes )
+    ds_train = tormentor.AugmentedDs( ds_train, augChoice, computation_device='cuda', augment_sample_function=augment_with_bboxes )
 
     dl_train = DataLoader( ds_train, batch_size=hyper_params['batch_size'], shuffle=True, collate_fn = lambda b: tuple(zip(*b)))
     dl_val = DataLoader( ds_val, batch_size=1, collate_fn = lambda b: tuple(zip(*b)))
